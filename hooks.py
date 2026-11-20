@@ -152,6 +152,20 @@ class Hooks:
         except Exception:  # noqa: BLE001
             return ""
 
+    @staticmethod
+    def _place() -> tuple[str, str]:
+        """The chat and the topic of the session running now, as Hermes itself knows them ("" when it has none)."""
+        try:
+            from gateway.session_context import get_session_env
+
+            def one(name: str) -> str:
+                value = get_session_env(name)
+                return str(value).strip() if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
+
+            return one("HERMES_SESSION_CHAT_ID"), one("HERMES_SESSION_THREAD_ID")
+        except Exception:  # noqa: BLE001
+            return "", ""
+
     # ------------------------------------------------------------ approvals and questions
 
     def pre_tool_call(self, **kwargs: Any) -> None:
@@ -348,9 +362,10 @@ class Hooks:
         if not body or events.is_silent_response(response) or self._automation(platform):
             return
         turn_id = _text(kwargs.get("turn_id"))
+        chat, thread = self._place() if platform == "telegram" else ("", "")
         ready = events.build(
             events.REPLY, identifier=events.event_id("response", turn_id or uuid.uuid4().hex, session_id), profile=self._profile(),
-            session_id=session_id, platform=platform, title=self._title(session_id), body=body,
+            session_id=session_id, platform=platform, title=self._title(session_id), body=body, chat=chat, thread=thread,
         )
         if not turn_id:
             self._enqueue(ready)

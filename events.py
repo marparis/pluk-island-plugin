@@ -62,6 +62,10 @@ def profile_name(value: Any) -> str:
     return value if isinstance(value, str) and _PROFILE.match(value) else "default"
 
 
+_CHAT = re.compile(r"^-?[0-9]{1,20}$")
+_THREAD = re.compile(r"^[0-9]{1,10}$")
+
+
 def build(
     kind: str,
     *,
@@ -76,6 +80,8 @@ def build(
     request_id: str = "",
     questions: list[dict[str, Any]] | None = None,
     tool: str = "",
+    chat: str = "",
+    thread: str = "",
     now: float | None = None,
 ) -> dict[str, Any]:
     event: dict[str, Any] = {"id": identifier, "type": kind, "ts": int(now if now is not None else time.time()),
@@ -86,6 +92,12 @@ def build(
         event["session_key"] = session_key
     if platform:
         event["platform"] = clean(platform, 32)
+    # Where in Telegram it was said (the chat's number, and the topic's in a forum), so a tap opens that conversation.
+    # Numbers only: no name, no word of the conversation.
+    if platform == "telegram" and isinstance(chat, str) and _CHAT.match(chat):
+        event["chat"] = chat
+        if isinstance(thread, str) and _THREAD.match(thread):
+            event["thread"] = thread
     if title:
         event["title"] = shown_clean(title, 120)
     if body:
