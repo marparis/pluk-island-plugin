@@ -1,0 +1,2892 @@
+# Taken from Hermes Conduit's notifier plugin (hermes-conduit-notifier v0.195.4, pulse_store.py).
+# MIT License, Copyright (c) 2026 Hermes Conduit contributors: see LICENSE-CONDUIT in this folder.
+# Changed for PLUK Island: its own database, apart from Conduit's.
+"""Pulse's own state: its settings, every delivery attempt, the outcome ledger and memory.
+
+Pulse (designs/proactivity.md) sends messages as turns in one home chat. This
+store keeps what Pulse decided and tried; what Hermes actually did is read
+back from Hermes's own state.db (``pulse_hermes``) and written here only as
+the attempt's derived state. SQLite in the profile's Hermes home, so the
+gateway process (hooks, the probe thread) and the CLI share it.
+
+Never raises into a hook: callers wrap it. Off unless ``enabled`` is set.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import sqlite3
+import threading
+import time
+from pathlib import Path
+from typing import Any, Callable, Optional, Sequence
+
+from . import pulse_prefs as prefs
+
+DB_NAME = "pluk-pulse.db"
+# How long the store waits on another process's write before giving up.
+BUSY_TIMEOUT_S = 5.0
+
+# An attempt's states (designs/proactivity.md 6.4.1). Only Hermes's rows move
+# an attempt past ``submitted``; ``refused`` is inject_message saying False.
+SUBMITTED = "submitted"
+REFUSED = "refused"
+NOT_ADMITTED = "not_admitted"
+QUEUED = "queued"
+RUNNING = "running"
+DELIVERED = "delivered"
+FAILED = "failed"
+IN_FLIGHT = (SUBMITTED, QUEUED, RUNNING)
+FINAL = (REFUSED, NOT_ADMITTED, DELIVERED, FAILED)
+
+DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "home_title": "Pulse",
+    "probe_interval_hours": 6.0,
+    "probe_requested": False,
+    # A session key chosen with `pulse home`, over the chat found by title.
+    "home_session_key": "",
+    # Settings > Pulse's model ({"provider", "model"}): Pulse's chat stays on
+    # it, put back before each Pulse turn. None leaves the chat's own.
+    "turn_model": None,
+    # When the gateway's loop last ran with Pulse on (time.time()).
+    "last_tick_at": None,
+    # The shadow report: on while Pulse is, at these local times, in the
+    # phone's time zone unless one is set here.
+    "daily_report": True,
+    "report_time": "08:00,13:00,18:00",
+    "time_zone": "",
+    "report_requested": False,
+    # "all": the report and memory also read every other profile's chats,
+    # memories and cron jobs (Bot Mode's bots are profiles); "this": only
+    # this profile.
+    "report_profiles": "all",
+    # Memory (pulse_memory): on while Pulse is. It reads chats written after
+    # ``memory_since`` (set when it first runs), at most every few minutes.
+    "memory": True,
+    # Follow-ups (pulse_followup): Pulse checks on what Hermes promised and
+    # brings the news to the home chat. On while Pulse and memory are.
+    "followups": True,
+    # The morning brief (pulse_brief): every day at this local time, an hour
+    # before the first report by default so the two don't arrive together.
+    "brief_time": "07:00",
+    # The look ahead (pulse_ahead): once a day before the brief, the next two
+    # weeks' dates and plans. On while Pulse memory is.
+    "look_ahead": True,
+    "ahead_requested": False,  # `pulse ahead now`
+    # Deadlines from the Shortcuts inbox (pulse_memory.read_inbox): memory
+    # also reads what the phone's automations log and keeps deadlines, like a
+    # trial ending or a bill due. On while Pulse memory is.
+    "inbox_deadlines": True,
+    # Looking things up first (pulse_tools): a report, follow-up or brief turn
+    # may read the calendar, contacts and Maps before it speaks. On with Pulse.
+    "look_first": True,
+    # Where you are (pulse_places): Pulse reads the location Conduit shares
+    # in the background, for what waits for a place and for its look-ups.
+    # Off until the user turns it on.
+    "where": False,
+    # Walking past (pulse_spots): with Where you are, the phone watches a few
+    # shops near the user for what the look ahead held for one. On with it.
+    "spots": True,
+    # Hide private reminders on the Lock Screen (pulse_push): a push about a
+    # gift, a surprise, someone's day, health or money says only "Pulse has
+    # something for you". On until the user turns it off.
+    "private_pushes": True,
+    # Quiet times (pulse_quiet): the weekdays Pulse keeps to itself (Monday
+    # 0 to Sunday 6) and when a quiet spell ends (epoch seconds), in the
+    # user's time zone.
+    "quiet_days": [],
+    "quiet_until": None,
+    # The night (pulse_hours): from and to, "HH:MM" in the user's time zone;
+    # nothing pushes in it unless it can't wait. [] for none.
+    "night": ["22:00", "07:00"],
+    "memory_since": None,
+    "memory_run_at": 0.0,
+    "memory_requested": False,
+    "followups_now_requested": None,  # when `pulse followups now` asked (pulse_followup)
+    # Memory stops for the day once its model calls used this many tokens.
+    "memory_daily_tokens": 300_000,
+    # Follow-up checks have their own day, so a backfill that spends
+    # memory's can't keep promises and to-dos from being checked.
+    "followup_daily_tokens": None,  # None: the nudge level's
+    "followup_today": None,  # {"day", "tokens"}
+    "nudge": "balanced",  # gentle, balanced or eager: pulse_learning.NUDGES
+    # A backfill of older history: {"from", "to", "days", "active", "done"},
+    # read after the chats as they happen (pulse_memory.run).
+    "memory_backfill": None,
+    "memory_backfill_days": 30,  # what `pulse memory backfill start` reads
+    "memory_backfill_unreadable": [],  # profiles the backfill couldn't read on its last run
+}
+# Which process runs the loop: {"owner": "host:pid", "until": time.time(), "build": pulse.build_stamp()}.
+LEADER = "leader"
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS attempts (
+    attempt_id TEXT PRIMARY KEY,
+    item_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    tag TEXT NOT NULL UNIQUE,
+    text TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    state TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    turn_id TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    -- What its turn looked up (pulse_tools labels, JSON; "" for nothing).
+    looked TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS attempts_state ON attempts(state);
+CREATE TABLE IF NOT EXISTS outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at REAL NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    turn_id TEXT NOT NULL DEFAULT '',
+    task_id TEXT NOT NULL DEFAULT '',
+    tool_call_id TEXT NOT NULL DEFAULT '',
+    tool TEXT NOT NULL,
+    action TEXT NOT NULL DEFAULT '',
+    label TEXT NOT NULL DEFAULT '',
+    args_digest TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    error_type TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    ids_json TEXT NOT NULL DEFAULT '{}',
+    duration_ms INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS outcomes_at ON outcomes(at);
+CREATE TABLE IF NOT EXISTS report_ratings (
+    attempt_id TEXT PRIMARY KEY,
+    items_json TEXT NOT NULL,
+    ratings_json TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS outcomes_session ON outcomes(session_id);
+CREATE TABLE IF NOT EXISTS items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    -- The model's own words: only ``evidence`` is checked against the chat.
+    text TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    explicit INTEGER NOT NULL,
+    due TEXT NOT NULL DEFAULT '',
+    due_at REAL,
+    mentioned_at REAL NOT NULL,
+    recorded_at REAL NOT NULL,
+    valid_from REAL NOT NULL,
+    valid_to REAL,
+    superseded_at REAL,
+    superseded_by INTEGER,
+    status TEXT NOT NULL DEFAULT 'open',
+    closed_by TEXT NOT NULL DEFAULT '',
+    closed_at REAL,
+    -- A fact about a date that comes back every year (pulse_dates): "MM-DD",
+    -- or "YYYY-MM-DD" with the year it began; "" for none. Such a fact has
+    -- no due date, so it never expires.
+    every_year TEXT NOT NULL DEFAULT '',
+    -- What that date is: birthday, anniversary or other.
+    occasion TEXT NOT NULL DEFAULT '',
+    -- A deadline memory found in the Shortcuts inbox (pulse_memory.read_inbox):
+    -- the event it came from, "<device>/<event id>", and who that event is from;
+    -- "" for what came from a chat.
+    from_inbox TEXT NOT NULL DEFAULT '',
+    sender TEXT NOT NULL DEFAULT '',
+    -- A commitment or promise said for a place, not a time (pulse_places):
+    -- the place's words as said ("Costco", "home"), and whether it's for
+    -- arriving there or leaving ("arrive" or "leave"); "" for none.
+    place_words TEXT NOT NULL DEFAULT '',
+    place_on TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS items_status ON items(status, kind);
+CREATE TABLE IF NOT EXISTS watermarks (
+    profile TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    at REAL NOT NULL,
+    failures INTEGER NOT NULL DEFAULT 0,
+    retry_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (profile, chat_id)
+);
+-- Pulse follow-ups (pulse_followup): a check schedule per open promise and
+-- the last decision, which `pulse followups` shows as the journal.
+CREATE TABLE IF NOT EXISTS followups (
+    item_id INTEGER PRIMARY KEY,
+    next_check_at REAL,
+    checks INTEGER NOT NULL DEFAULT 0,
+    failures INTEGER NOT NULL DEFAULT 0,
+    decision TEXT NOT NULL DEFAULT '',
+    news TEXT NOT NULL DEFAULT '',
+    why TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    -- When its news may push (pulse_followup.followup_timing, JSON; "" for
+    -- nothing said): when it's useful, whether it's urgent, what held it.
+    timing TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS followups_due ON followups(next_check_at);
+-- What Pulse brought the user (pulse_learning), for Conduit's Pulse screen,
+-- with the user's rating of each.
+CREATE TABLE IF NOT EXISTS cards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    item_id INTEGER,
+    -- The loudness it went out at: push, screen or brief; or ``moment``
+    -- (MOMENT) while it waits, off the screen, for an arrival or departure.
+    level TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    quote TEXT NOT NULL DEFAULT '',
+    news TEXT NOT NULL DEFAULT '',
+    why TEXT NOT NULL DEFAULT '',
+    profile TEXT NOT NULL DEFAULT '',
+    chat_id TEXT NOT NULL DEFAULT '',
+    chat_title TEXT NOT NULL DEFAULT '',
+    message_id INTEGER,
+    -- A report item's kind (pulse_report.KINDS) on a "noticed" card.
+    topic TEXT NOT NULL DEFAULT '',
+    -- The morning brief it went out in (that brief's attempt item id), on
+    -- the brief's own card and the held cards it brought.
+    brief TEXT NOT NULL DEFAULT '',
+    -- Swiped away ("Not now"): off the list, nothing learned.
+    dismissed_at REAL,
+    -- Not now until a time (later today, tomorrow, next week): when the card
+    -- comes back as new (pulse_followup.return_rested).
+    rest_until REAL,
+    created_at REAL NOT NULL,
+    seen_at REAL,
+    briefed_at REAL,
+    rating TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    rated_at REAL,
+    -- The biggest part learning played in bringing it up (pulse_prefs'
+    -- Learned.factor, JSON; "" for none), for its Why?.
+    learned TEXT NOT NULL DEFAULT '',
+    -- Where it came from and how soon it was due as it came up
+    -- (pulse_prefs.place and band), which its signals carry once the
+    -- journal no longer has its candidate.
+    place TEXT NOT NULL DEFAULT '',
+    band TEXT NOT NULL DEFAULT '',
+    -- Put back with Undo after Pulse marked it done: its chat isn't read
+    -- again to mark it (pulse_followup.read_first, found_cards).
+    put_back_at REAL,
+    -- What the turn that brought it up looked up first (attempts.looked),
+    -- for its Why?.
+    looked TEXT NOT NULL DEFAULT '',
+    -- A suggestion's card (kind "proposal"): its proposals row.
+    proposal INTEGER,
+    -- A look ahead's pick held for a place (pulse_places, JSON): the saved
+    -- place, arrive or leave, until when, and once a moment reached it, when.
+    moment TEXT NOT NULL DEFAULT '',
+    -- Back once after a Do it that stalled (pulse_followup.come_back):
+    -- "unsent" when Do it was left unsent or "not_done" when its checks
+    -- found it not done ("" for a card never back) and when that Do it was
+    -- tapped. No commas here: SQLite's DROP COLUMN takes one for the column's.
+    back TEXT NOT NULL DEFAULT '',
+    back_acted_at REAL
+);
+CREATE INDEX IF NOT EXISTS cards_created ON cards(created_at);
+-- What Hermes said in a chat it had just done with a tool (pulse_claims), kept
+-- to judge: "reminder", "event", "job" or "message", its words and when it
+-- said them, its turn (from the user's message to their next, NULL while
+-- there's none), the call that backed it ("" for none) and the turn's calls
+-- as digest lines (JSON). One per message and action.
+CREATE TABLE IF NOT EXISTS claims (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    text TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    said_at REAL NOT NULL,
+    turn_from REAL NOT NULL,
+    turn_to REAL,
+    backed_by TEXT NOT NULL DEFAULT '',
+    calls_json TEXT NOT NULL DEFAULT '[]',
+    kept_at REAL NOT NULL,
+    UNIQUE(chat_id, message_id, action)
+);
+-- Walking past (pulse_spots): each shop the phone said the user walked
+-- into, the watch it was for, and how late iOS told the app (how far inside
+-- the circle the fix was, and the estimate made from it). Kept 30 days, and
+-- deleted with the moments (Pulse or Where you are off, a wipe).
+CREATE TABLE IF NOT EXISTS spot_entries (
+    id TEXT PRIMARY KEY,
+    device TEXT NOT NULL,
+    watch TEXT NOT NULL,
+    query TEXT NOT NULL,
+    name TEXT NOT NULL,
+    at REAL NOT NULL,
+    received_at REAL NOT NULL,
+    distance_m REAL,
+    accuracy_m REAL,
+    speed_mps REAL,
+    radius_m REAL,
+    depth_m REAL,
+    late_s REAL,
+    -- The watch's intent (pulse_spots.INTENTS), and whether the fix said the
+    -- user was close enough for it (an entry that wasn't makes no moment).
+    intent TEXT NOT NULL DEFAULT 'opportunity',
+    confirmed INTEGER NOT NULL DEFAULT 1,
+    -- The moment it became ('' when its watch was gone).
+    moment TEXT NOT NULL DEFAULT ''
+);
+-- What ratings taught Pulse (pulse_learning): each row changes what Pulse
+-- does until it's undone.
+CREATE TABLE IF NOT EXISTS lessons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    what TEXT NOT NULL,
+    value TEXT NOT NULL DEFAULT '',
+    profile TEXT NOT NULL DEFAULT '',
+    chat_id TEXT NOT NULL DEFAULT '',
+    card_id INTEGER,
+    cause TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    undone_at REAL
+);
+-- Cards the user marked done on the Pulse screen (pulse_learning.done),
+-- with what the item and its checks were before, if one is behind the card,
+-- so Undo puts them back.
+CREATE TABLE IF NOT EXISTS card_done (
+    card_id INTEGER PRIMARY KEY,
+    done_at REAL NOT NULL,
+    -- "user" (Done on the screen) or "pulse" (it saw the chat get it done after Do it).
+    done_by TEXT NOT NULL DEFAULT 'user',
+    prior_json TEXT NOT NULL DEFAULT '{}'
+);
+-- Do it on a card (pulse_followup.check_acts): once the chat has answered,
+-- Pulse reads it and marks the card done if it got done.
+CREATE TABLE IF NOT EXISTS card_acts (
+    card_id INTEGER PRIMARY KEY,
+    acted_at REAL NOT NULL,
+    check_at REAL,
+    checks INTEGER NOT NULL DEFAULT 0,
+    outcome TEXT NOT NULL DEFAULT '',
+    why TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS backfill_marks (
+    profile TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    at REAL NOT NULL,
+    failures INTEGER NOT NULL DEFAULT 0,
+    retry_at REAL NOT NULL DEFAULT 0,
+    window_from REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (profile, chat_id)
+);
+-- Everything a report's candidate list put in front of Pulse
+-- (pulse_candidates), what it decided about each, and why: kept 30 days, so
+-- "why didn't you tell me about X?" has an answer as well as "why that?".
+CREATE TABLE IF NOT EXISTS candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    -- "memory": a remembered item the report listed (or kept out);
+    -- "model": something else the report's model found.
+    origin TEXT NOT NULL,
+    item_id INTEGER,
+    kind TEXT NOT NULL,
+    profile TEXT NOT NULL DEFAULT '',
+    chat_id TEXT NOT NULL DEFAULT '',
+    -- Where the model found it: chat, calendar, reminders, notes, jobs or tools.
+    source TEXT NOT NULL DEFAULT '',
+    area TEXT NOT NULL DEFAULT '',
+    due_at REAL,
+    actionable INTEGER,
+    -- The model's guess at how useful it is now (1-5), its own pick under
+    -- the user's bar, and its one-word reason to leave it out.
+    value INTEGER,
+    bring_up INTEGER NOT NULL DEFAULT 0,
+    skip TEXT NOT NULL DEFAULT '',
+    -- What it would tell the user (or the remembered item's own text).
+    text TEXT NOT NULL DEFAULT '',
+    -- Why now, and where it came from, in its words to the user: the card's Why?.
+    why TEXT NOT NULL DEFAULT '',
+    decision TEXT NOT NULL,
+    rank INTEGER,
+    card_id INTEGER,
+    -- The user asked to be reminded of it (a found candidate's flag).
+    asked INTEGER,
+    -- How the router saw it (pulse_candidates.route): how soon it was due
+    -- (pulse_prefs.band), where it came from (pulse_prefs.place), its score,
+    -- the biggest part learning played in it (JSON, "" for none), whether it
+    -- was a floor, and the loudness it came up at ("" when it didn't).
+    band TEXT NOT NULL DEFAULT '',
+    place TEXT NOT NULL DEFAULT '',
+    score REAL,
+    factor TEXT NOT NULL DEFAULT '',
+    floor INTEGER NOT NULL DEFAULT 0,
+    level TEXT NOT NULL DEFAULT '',
+    -- What a look ahead's candidate is about (pulse_ahead): for a yearly
+    -- date at a lead time, the date and the lead time, so each comes up
+    -- once a year; "" for the rest.
+    ref TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS candidates_run ON candidates(run_id);
+CREATE INDEX IF NOT EXISTS candidates_created ON candidates(created_at);
+-- What the user did with cards (pulse_prefs): one row per card and kind of
+-- signal (a thumb, Do it by how far it got, Done), with the card's kind,
+-- place and band as it came up, and when it was pushed if it was. Pulse's
+-- learning is recomputed from these, so taking one back is exact.
+CREATE TABLE IF NOT EXISTS signals (
+    card_id INTEGER NOT NULL,
+    what TEXT NOT NULL,
+    at REAL NOT NULL,
+    useful REAL NOT NULL DEFAULT 0,
+    weight REAL NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL DEFAULT '',
+    place TEXT NOT NULL DEFAULT '',
+    band TEXT NOT NULL DEFAULT '',
+    pushed REAL,
+    PRIMARY KEY (card_id, what)
+);
+CREATE INDEX IF NOT EXISTS signals_at ON signals(at);
+-- Pulse's suggestions (pulse_proposals): a calendar add a Pulse turn asked
+-- for, checked and kept instead of made, which its card adds with one tap.
+CREATE TABLE IF NOT EXISTS proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    attempt_id TEXT NOT NULL,
+    -- add_event or add_reminder, and its fields as the phone gets them.
+    kind TEXT NOT NULL,
+    fields TEXT NOT NULL,
+    -- The phone it goes to, and the profile whose phone store has it.
+    device TEXT NOT NULL,
+    profile TEXT NOT NULL DEFAULT '',
+    -- What its card says, written by code from the fields.
+    line TEXT NOT NULL,
+    -- waiting, approved, dismissed or expired. Add's change and Undo's
+    -- delete get their ids here before the phone store is asked for them,
+    -- at decided_at and undo_at; asked_at once it has Add's.
+    state TEXT NOT NULL DEFAULT 'waiting',
+    change_id TEXT NOT NULL DEFAULT '',
+    undo_id TEXT NOT NULL DEFAULT '',
+    card_id INTEGER,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    decided_at REAL,
+    asked_at REAL,
+    undo_at REAL
+);
+CREATE INDEX IF NOT EXISTS proposals_attempt ON proposals(attempt_id);
+-- Arrivals at and departures from the user's saved places, as the location
+-- store told Pulse (pulse_places), kept a day: what each made due, or why
+-- it made nothing. One from a phone that keeps no history keeps only its
+-- id and when it was handled.
+CREATE TABLE IF NOT EXISTS moments (
+    id TEXT PRIMARY KEY,
+    place_id TEXT NOT NULL DEFAULT '',
+    place TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT '',
+    -- "arrive" or "leave".
+    event TEXT NOT NULL DEFAULT '',
+    at REAL NOT NULL,
+    received_at REAL NOT NULL,
+    keep INTEGER NOT NULL DEFAULT 1,
+    -- A shop walked into (pulse_spots): the narrowest intent the phone's fix
+    -- was close enough for ('' for a saved place).
+    reach TEXT NOT NULL DEFAULT '',
+    handled_at REAL,
+    -- What it did (pulse_places.handle, JSON): the items it made due, or why none.
+    outcome TEXT NOT NULL DEFAULT ''
+);
+"""
+# Where memory has read each chat to: ``watermarks`` for chats as they
+# happen, ``backfill_marks`` for a backfill of older history (same shape, plus
+# the start of the window each mark belongs to: a mark from another window,
+# say one written as a backfill was cancelled, counts as no mark).
+MARKS = ("watermarks", "backfill_marks")
+
+
+def _check_marks(marks: str) -> None:
+    if marks not in MARKS:  # named into SQL
+        raise ValueError(f"unknown marks table {marks!r}")
+
+# A report's item on its own card (pulse_learning.add_noticed_cards).
+NOTICED = "noticed"
+# A lesson that forgets what learning holds about something (pulse_learning.reset).
+RESET = "reset"
+# A thumbs down's reason that says only the timing was wrong
+# (pulse_learning.WRONG_TIME): its card keeps no thumb signal.
+WRONG_TIME = "wrong_time"
+# Why an item memory learned after its time had passed is closed (pulse_memory.LATE_S).
+LATE_BY = "expiry: learned after its time had passed"
+# Whether Pulse memory reads the Shortcuts inbox for deadlines (DEFAULTS), and
+# where it read to (pulse_memory.read_inbox): [received_at, device, event id]
+# of the last event it read.
+INBOX_SETTING = "inbox_deadlines"
+INBOX_MARK = "inbox_mark"
+# Whether Pulse's turns may look things up first (DEFAULTS, pulse_tools).
+LOOK_SETTING = "look_first"
+# Whether Pulse reads where the user is (DEFAULTS, pulse_places).
+WHERE_SETTING = "where"
+# How long a moment is kept (pulse_places).
+MOMENTS_KEEP_S = 86400.0
+# The level of a card held for a moment (pulse_places): off the Pulse screen
+# until it comes up.
+MOMENT = "moment"
+# A deadline from the inbox is deleted this long after it's done, forgotten,
+# replaced or expired (pulse_memory.forget_inbox): Undo works that long.
+INBOX_FORGET_S = 86400.0
+# The report attempts split into such cards, newest last: their typed
+# ratings aren't read, so an item isn't counted twice.
+SPLIT_REPORTS = "split_reports"
+# The items_json of a split report's ratings row: it holds no ratings and takes none.
+SPLIT_ITEMS = '"split"'
+
+CARD_COLUMNS = ("kind", "item_id", "level", "title", "quote", "news", "why", "profile", "chat_id", "chat_title",
+                "message_id", "topic", "brief", "created_at", "learned", "place", "band", "looked", "proposal",
+                "moment", "look", "subject")
+# The suggestion columns a tap moves (PulseStore.swap_proposal).
+_PROPOSAL_MOVES = ("state", "change_id", "undo_id", "decided_at", "asked_at", "undo_at")
+# Card columns added after the first build, oldest first, with their types.
+# Columns a table gained after stores existed, added to a store from before.
+_ADDED_COLUMNS = (("cards", "topic", "TEXT NOT NULL DEFAULT ''"), ("cards", "brief", "TEXT NOT NULL DEFAULT ''"),
+                  ("cards", "dismissed_at", "REAL"), ("cards", "rest_until", "REAL"),
+                  ("candidates", "why", "TEXT NOT NULL DEFAULT ''"), ("candidates", "asked", "INTEGER"),
+                  ("candidates", "band", "TEXT NOT NULL DEFAULT ''"), ("candidates", "place", "TEXT NOT NULL DEFAULT ''"),
+                  ("candidates", "score", "REAL"), ("candidates", "factor", "TEXT NOT NULL DEFAULT ''"),
+                  ("candidates", "floor", "INTEGER NOT NULL DEFAULT 0"),
+                  ("candidates", "level", "TEXT NOT NULL DEFAULT ''"),
+                  ("cards", "learned", "TEXT NOT NULL DEFAULT ''"), ("cards", "place", "TEXT NOT NULL DEFAULT ''"),
+                  ("cards", "band", "TEXT NOT NULL DEFAULT ''"), ("followups", "timing", "TEXT NOT NULL DEFAULT ''"),
+                  ("cards", "put_back_at", "REAL"), ("items", "every_year", "TEXT NOT NULL DEFAULT ''"),
+                  ("items", "occasion", "TEXT NOT NULL DEFAULT ''"), ("candidates", "ref", "TEXT NOT NULL DEFAULT ''"),
+                  ("items", "from_inbox", "TEXT NOT NULL DEFAULT ''"), ("items", "sender", "TEXT NOT NULL DEFAULT ''"),
+                  ("attempts", "looked", "TEXT NOT NULL DEFAULT ''"), ("cards", "looked", "TEXT NOT NULL DEFAULT ''"),
+                  ("cards", "proposal", "INTEGER"), ("items", "place_words", "TEXT NOT NULL DEFAULT ''"),
+                  ("items", "place_on", "TEXT NOT NULL DEFAULT ''"), ("cards", "moment", "TEXT NOT NULL DEFAULT ''"),
+                  ("cards", "back", "TEXT NOT NULL DEFAULT ''"), ("cards", "back_acted_at", "REAL"),
+                  ("moments", "reach", "TEXT NOT NULL DEFAULT ''"),
+                  ("attempts", "text_sha", "TEXT NOT NULL DEFAULT ''"),
+                  ("cards", "look", "TEXT NOT NULL DEFAULT ''"), ("cards", "subject", "TEXT NOT NULL DEFAULT ''"),
+                  ("cards", "updated_at", "REAL"), ("candidates", "pick", "TEXT NOT NULL DEFAULT ''"),
+                  ("candidates", "subject", "TEXT NOT NULL DEFAULT ''"), ("followups", "pick", "TEXT NOT NULL DEFAULT ''"),
+                  # The chat Do it used for a card from no chat, when the app named one
+                  # (a bot's Bot Chat, in the bot's profile): the act check reads it.
+                  ("card_acts", "chat_profile", "TEXT"), ("card_acts", "chat_id", "TEXT NOT NULL DEFAULT ''"))
+# What report cards said for Why? before a candidate's reason did (an item's card,
+# never shown; a whole report's card), and the setting that says a store has
+# cleared them.
+_STOCK_NOTICED_WHY = "From your Pulse report: something Hermes noticed in your chats, calendar or notes."
+_STOCK_REPORT_WHY = "Your Pulse report: what Hermes saw in your chats since the last one."
+STOCK_WHY_CLEARED = "stock_noticed_why_cleared"
+LESSON_COLUMNS = ("kind", "what", "value", "profile", "chat_id", "card_id", "cause", "created_at")
+CANDIDATE_COLUMNS = ("origin", "item_id", "kind", "profile", "chat_id", "source", "area", "due_at", "actionable",
+                     "value", "bring_up", "skip", "text", "why", "decision", "rank", "asked", "band", "place",
+                     "score", "factor", "floor", "level", "ref", "pick", "subject")
+# The setting that says a store's signals were first filled in from the
+# ratings, Do its and Dones it had before signals were kept (_sync_signals),
+# and its two-thumb steps retired: before learning, two net thumbs moved a
+# kind a step along the loudness ladder as a lesson with one of
+# STEPPED_CAUSES; those thumbs are signals now, so the steps are undone
+# once, and the old running score (OLD_SCORES) goes.
+SIGNALS_BACKFILLED = "signals_backfilled"
+STEPPED_CAUSES = ("2 thumbs up", "2 thumbs down")
+OLD_SCORES = "rating_scores"
+# Who closed a card's item when the user marked it Done (pulse_learning.DONE_BY's "user").
+USER = "user"
+# Who marked a card done when a chat showed it done (card_done's done_by).
+PULSE = "pulse"
+# Who closed a card when a later pick said its incident was over (pulse_picks:
+# the job recovered, the parcel came): not the user's Done, and not a sign
+# the same words are dealt with, so the next incident's card can say them.
+INCIDENT = "incident"
+
+
+def _listed(conn: Any, key: str) -> list[str]:
+    """A list setting's entries, as strings ([] when unset or not a list)."""
+    found = conn.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
+    value = json.loads(found["value_json"]) if found else None
+    return [str(entry) for entry in value] if isinstance(value, list) else []
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}  # a table _ADDED_COLUMNS names
+
+
+# text_sha of an attempt whose whole text was gone before digests were kept.
+UNKNOWN_DIGEST = "unknown"
+
+
+def text_digest(text: str) -> str:
+    """An attempt's whole text as ``text_sha`` keeps it (room_memory reads it),
+    without the whitespace around it: Hermes hands a provider the person's last
+    message stripped (notifier #652)."""
+    return hashlib.sha256(text.strip().encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _check_columns(row: dict, allowed: tuple) -> None:
+    unknown = set(row) - set(allowed)
+    if unknown:  # named into SQL
+        raise ValueError(f"unknown columns {sorted(unknown)!r}")
+
+
+# How far a replacement follows earlier replacements to the item still current.
+MAX_CHAIN = 20
+# ``items.profile`` and ``watermarks.profile`` are "" for the profile the
+# store belongs to, else the other profile's name (pulse_report.profile_homes).
+# ``attempts.session_key`` holds the home chat's stored session id (the
+# column kept its first name so a store from the first build still opens).
+
+_lock = threading.Lock()
+# What each store's signals added up to when last fitted (``learned``): its
+# path's (the signals' totals, when, the fit). Fitted again once the signals
+# change, or after LEARNED_FOR_S, over which fading changes next to nothing.
+_learned: dict[str, tuple[tuple, float, prefs.Learned]] = {}
+LEARNED_FOR_S = 600.0
+
+
+def close_time(value: Any) -> float:
+    """An item's ``closed_at`` as a number: 0.0 for none, or for one stored
+    as text (something outside Pulse wrote one on a host; Eric, 2026-11-08),
+    which counts as long ago rather than failing whatever reads it."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return float(value)
+
+
+def _same_host(a: Any, b: Any) -> bool:
+    """Whether two lease owners (``host:pid``) name the same host."""
+    return str(a).rpartition(":")[0] == str(b).rpartition(":")[0]
+
+class PulseStore:
+    def __init__(self, path: Path, busy_timeout_s: float = BUSY_TIMEOUT_S) -> None:
+        self.path = Path(path)
+        self.busy_timeout_s = busy_timeout_s
+        with self._connect() as conn:
+            conn.executescript(_SCHEMA)
+            # A store from before a table had these.
+            for table, column, kind in _ADDED_COLUMNS:
+                if column in _columns(conn, table):
+                    continue
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+                except sqlite3.OperationalError:
+                    # Another process opening the same store added it first.
+                    if column not in _columns(conn, table):
+                        raise
+            conn.execute("CREATE INDEX IF NOT EXISTS cards_subject ON cards(subject)")
+            # Attempts from before text_sha: a whole text gets its digest; one
+            # trim_finished may have cut already (finished, of a kind it cuts, one
+            # line) gets UNKNOWN_DIGEST, so no message is taken for it by its first line.
+            for attempt_id, kind, state, text in conn.execute(
+                    "SELECT attempt_id, kind, state, text FROM attempts WHERE text_sha=''").fetchall():
+                # trim_finished keeps only a first line, so a text with a line
+                # break is still whole.
+                cut = state in FINAL and kind != "probe" and "\n" not in (text or "")
+                conn.execute("UPDATE attempts SET text_sha=? WHERE attempt_id=? AND text_sha=''",
+                             (UNKNOWN_DIGEST if cut else text_digest(text or ""), attempt_id))
+            # A report card's why is now its candidate's reason, or nothing: the stock
+            # lines from before (an item's, a whole report's) would show behind Why? as
+            # if they were one. Cleared once,
+            # with its marker in the same transaction, so a store from before candidate
+            # lists, or one a process stopped with midway, is cleared too.
+            if conn.execute("SELECT 1 FROM settings WHERE key=?", (STOCK_WHY_CLEARED,)).fetchone() is None:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if conn.execute("SELECT 1 FROM settings WHERE key=?", (STOCK_WHY_CLEARED,)).fetchone() is None:
+                        conn.execute("UPDATE cards SET why='' WHERE kind=? AND why=?", (NOTICED, _STOCK_NOTICED_WHY))
+                        conn.execute("UPDATE cards SET why='' WHERE kind='report' AND why=?", (_STOCK_REPORT_WHY,))
+                        conn.execute("INSERT INTO settings(key, value_json) VALUES(?, 'true')", (STOCK_WHY_CLEARED,))
+                    conn.execute("COMMIT")
+                except BaseException:
+                    conn.execute("ROLLBACK")
+                    raise
+            # Signals as the cards say: each card's rating, Do it and Done, so what Pulse
+            # learns starts from what the store already knows, and takes in (or back) what
+            # a process from before signals, still running, wrote without them. The
+            # two-thumb steps retire once.
+            since = time.time() - prefs.KEEP_S
+            first = conn.execute("SELECT 1 FROM settings WHERE key=?", (SIGNALS_BACKFILLED,)).fetchone() is None
+            if first or any(_signal_gaps(conn, since).values()):
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    _sync_signals(conn, _signal_gaps(conn, since))
+                    if conn.execute("SELECT 1 FROM settings WHERE key=?", (SIGNALS_BACKFILLED,)).fetchone() is None:
+                        conn.execute(f"UPDATE lessons SET undone_at=? WHERE what='level' AND undone_at IS NULL "
+                                     f"AND cause IN ({', '.join('?' * len(STEPPED_CAUSES))})",
+                                     (time.time(), *STEPPED_CAUSES))
+                        conn.execute("DELETE FROM settings WHERE key=?", (OLD_SCORES,))
+                        conn.execute("INSERT INTO settings(key, value_json) VALUES(?, 'true')", (SIGNALS_BACKFILLED,))
+                    conn.execute("COMMIT")
+                except BaseException:
+                    conn.execute("ROLLBACK")
+                    raise
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.path), timeout=self.busy_timeout_s, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        return _Closing(conn)
+
+    # Settings ---------------------------------------------------------------
+
+    def get(self, key: str) -> Any:
+        with self._connect() as conn:
+            row = conn.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return DEFAULTS.get(key)
+        try:
+            return json.loads(row["value_json"])
+        except ValueError:
+            return DEFAULTS.get(key)
+
+    def set(self, key: str, value: Any) -> None:
+        with _lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO settings(key, value_json) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+                (key, json.dumps(value)),
+            )
+
+    def swap(self, key: str, old: Any, new: Any) -> bool:
+        """Sets ``key`` to ``new`` only if it still holds ``old`` (another
+        process may have changed it since it was read)."""
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
+            try:
+                current = json.loads(row["value_json"]) if row else DEFAULTS.get(key)
+            except ValueError:
+                current = DEFAULTS.get(key)
+            if current != old:
+                conn.execute("ROLLBACK")
+                return False
+            conn.execute("INSERT INTO settings(key, value_json) VALUES(?, ?) "
+                         "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json", (key, json.dumps(new)))
+            conn.execute("COMMIT")
+        return True
+
+    def take_probe_request(self) -> bool:
+        """Whether a probe was asked for (``pulse probe``), clearing the ask."""
+        return self.take_request("probe_requested")
+
+    def take_request(self, key: str) -> bool:
+        """Whether the flag ``key`` was set (a CLI ask), clearing it."""
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
+            try:
+                asked = bool(row and json.loads(row["value_json"]))
+            except ValueError:
+                asked = False
+            if asked:
+                conn.execute("UPDATE settings SET value_json='false' WHERE key=?", (key,))
+            conn.execute("COMMIT")
+        return asked
+
+    def claim_leader(self, owner: str, ttl_s: float, now: float, build: str = "") -> bool:
+        """Whether ``owner`` runs the loop until ``now + ttl_s``: the lease is
+        its own, free, expired, or held on another build. Two processes
+        hosting sessions for the same Hermes home never both send.
+
+        A process stops running the loop once a newer build is installed over
+        it (pulse.tick), so a lease stamped with another build than the
+        claimer's is left by a process that no longer ticks: the dashboard a
+        plugin update restarted takes over at once, rather than reading as
+        an older copy until that lease runs out. Only on the same host: a
+        process elsewhere has its own install, so its own build stamp."""
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT value_json FROM settings WHERE key=?", (LEADER,)).fetchone()
+            try:
+                lease = json.loads(row["value_json"]) if row else None
+            except ValueError:
+                lease = None
+            held = (isinstance(lease, dict) and lease.get("owner") != owner
+                    and isinstance(lease.get("until"), (int, float)) and lease["until"] > now
+                    and not (build and isinstance(lease.get("build"), str) and lease["build"]
+                             and lease["build"] != build and _same_host(lease.get("owner"), owner)))
+            if not held:
+                conn.execute(
+                    "INSERT INTO settings(key, value_json) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+                    (LEADER, json.dumps({"owner": owner, "until": now + ttl_s, "build": build})),
+                )
+            conn.execute("COMMIT")
+        return not held
+
+    # Attempts ---------------------------------------------------------------
+
+    def add_attempt(self, *, attempt_id: str, item_id: str, attempt: int, kind: str, tag: str, text: str,
+                    session_key: str) -> None:
+        """Written before inject_message is called, so a crash right after the
+        call still leaves a record for the reconciler to look up."""
+        now = time.time()
+        with _lock, self._connect() as conn:
+            # The whole text's digest outlives trim_finished: the memory guard
+            # (room_memory) still tells the turn from the user's once the text is cut.
+            conn.execute(
+                "INSERT INTO attempts(attempt_id, item_id, attempt, kind, tag, text, session_key, state, "
+                "created_at, updated_at, text_sha) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (attempt_id, item_id, attempt, kind, tag, text, session_key, SUBMITTED, now, now, text_digest(text)),
+            )
+
+    def update_attempt(self, attempt_id: str, *, state: Optional[str] = None, detail: Optional[str] = None,
+                       turn_id: Optional[str] = None) -> None:
+        sets, values = ["updated_at=?"], [time.time()]
+        for column, value in (("state", state), ("detail", detail), ("turn_id", turn_id)):
+            if value is not None:
+                sets.append(f"{column}=?")
+                values.append(value)
+        with _lock, self._connect() as conn:
+            conn.execute(f"UPDATE attempts SET {', '.join(sets)} WHERE attempt_id=?", (*values, attempt_id))
+
+    def attempt_by_tag(self, tag: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM attempts WHERE tag=?", (tag,)).fetchone()
+        return dict(row) if row else None
+
+    def attempt(self, attempt_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+        return dict(row) if row else None
+
+    def note_looked(self, attempt_id: str, labels: Sequence[str]) -> None:
+        """Adds what a Pulse turn looked up (pulse_tools labels) to its
+        attempt, each once, in the order first used: its cards' Why?."""
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute("SELECT looked FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+                if row is not None:
+                    looked = looked_labels(row["looked"])
+                    looked += [label for label in dict.fromkeys(labels) if label not in looked]
+                    conn.execute("UPDATE attempts SET looked=? WHERE attempt_id=?", (json.dumps(looked), attempt_id))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def in_flight(self) -> list[dict]:
+        marks = ",".join("?" * len(IN_FLIGHT))
+        with self._connect() as conn:
+            rows = conn.execute(f"SELECT * FROM attempts WHERE state IN ({marks}) ORDER BY created_at",
+                                IN_FLIGHT).fetchall()
+        return [dict(row) for row in rows]
+
+    def recent(self, limit: int = 20) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM attempts ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_proposal(self, row: dict[str, Any], *, per_turn: int, per_day: int, day_from: float) -> Optional[int]:
+        """Keeps a suggestion (pulse_proposals), unless its turn already has
+        ``per_turn`` of them or ``per_day`` were made since ``day_from``:
+        checked and written in one transaction. Its id, or None."""
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                turn = conn.execute("SELECT COUNT(*) FROM proposals WHERE attempt_id=?",
+                                    (row["attempt_id"],)).fetchone()[0]
+                day = conn.execute("SELECT COUNT(*) FROM proposals WHERE created_at>=?", (day_from,)).fetchone()[0]
+                if turn >= per_turn or day >= per_day:
+                    conn.execute("ROLLBACK")
+                    return None
+                proposal_id = int(conn.execute(
+                    "INSERT INTO proposals(attempt_id, kind, fields, device, profile, line, created_at, expires_at) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    (row["attempt_id"], row["kind"], json.dumps(row["fields"]), row["device"], row["profile"],
+                     row["line"], row["created_at"], row["expires_at"])).lastrowid)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return proposal_id
+
+    def proposal_counts(self, attempt_id: str, day_from: float) -> tuple[int, int]:
+        """Suggestions made on this attempt's turn, and since ``day_from``."""
+        with self._connect() as conn:
+            turn = conn.execute("SELECT COUNT(*) FROM proposals WHERE attempt_id=?", (attempt_id,)).fetchone()[0]
+            day = conn.execute("SELECT COUNT(*) FROM proposals WHERE created_at>=?", (day_from,)).fetchone()[0]
+        return int(turn), int(day)
+
+    def proposal(self, proposal_id: Any) -> Optional[dict]:
+        if isinstance(proposal_id, bool) or not isinstance(proposal_id, int):
+            return None
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM proposals WHERE id=?", (proposal_id,)).fetchone()
+        return _proposal(row) if row else None
+
+    def proposals(self, *, state: Optional[str] = None, uncarded: bool = False, limit: int = 100) -> list[dict]:
+        """Suggestions, newest first: in ``state``, and without a card yet."""
+        where, values = [], []
+        if state is not None:
+            where.append("state=?")
+            values.append(state)
+        if uncarded:
+            where.append("card_id IS NULL")
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        with self._connect() as conn:
+            rows = conn.execute(f"SELECT * FROM proposals{clause} ORDER BY created_at DESC, id DESC LIMIT ?",
+                                (*values, limit)).fetchall()
+        return [_proposal(row) for row in rows]
+
+    def swap_proposal(self, proposal_id: int, was: dict[str, Any], **values: Any) -> bool:
+        """Sets ``values`` on a suggestion only while the columns in ``was``
+        still hold what was read: one write, so of two taps at once, a
+        retry or another device, one moves it and the other finds it moved.
+        Whether it moved."""
+        unknown = (set(was) | set(values)) - set(_PROPOSAL_MOVES)
+        if unknown or not was or not values:  # named into SQL
+            raise ValueError(f"unknown or missing columns {sorted(unknown)!r}")
+        with _lock, self._connect() as conn:
+            return conn.execute(
+                f"UPDATE proposals SET {', '.join(f'{key}=?' for key in values)} "
+                f"WHERE id=? AND {' AND '.join(f'{key} IS ?' for key in was)}",
+                (*values.values(), proposal_id, *was.values())).rowcount > 0
+
+    def add_proposal_card(self, proposal_id: int, row: dict[str, Any]) -> Optional[int]:
+        """The suggestion's card, once: the card and the link in one write,
+        and nothing when another process made it first. Its id, or None."""
+        _check_columns(row, CARD_COLUMNS)
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                linked = conn.execute("SELECT card_id FROM proposals WHERE id=?", (proposal_id,)).fetchone()
+                if linked is None or linked[0] is not None:  # gone meanwhile, or carded
+                    conn.execute("ROLLBACK")
+                    return None
+                card_id = int(conn.execute(f"INSERT INTO cards({', '.join(row)}) VALUES({', '.join('?' * len(row))})",
+                                           tuple(row.values())).lastrowid)
+                conn.execute("UPDATE proposals SET card_id=? WHERE id=?", (card_id, proposal_id))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return card_id
+
+    def expire_proposals(self, now: float, *, attempts: Sequence[str] = ()) -> int:
+        """Waiting suggestions past their time, and those of ``attempts``
+        (turns that ended without their message), become expired."""
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                changed = conn.execute("UPDATE proposals SET state='expired', decided_at=? "
+                                       "WHERE state='waiting' AND expires_at<=?", (now, now)).rowcount
+                if attempts:
+                    changed += conn.execute(
+                        f"UPDATE proposals SET state='expired', decided_at=? WHERE state='waiting' "
+                        f"AND attempt_id IN ({','.join('?' * len(attempts))})", (now, *attempts)).rowcount
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return changed
+
+    def prune_proposals(self, before: float) -> int:
+        """Drops suggestions made before ``before`` whose card is gone too."""
+        with _lock, self._connect() as conn:
+            return conn.execute("DELETE FROM proposals WHERE created_at<? AND (card_id IS NULL OR card_id NOT IN "
+                                "(SELECT id FROM cards))", (before,)).rowcount
+
+    def looked_attempts(self, limit: int = 20) -> list[dict]:
+        """The latest attempts whose turn looked something up, newest first."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM attempts WHERE looked != '' ORDER BY created_at DESC LIMIT ?",
+                                (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def last_attempt_at(self, kind: str) -> Optional[float]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT MAX(created_at) AS at FROM attempts WHERE kind=?", (kind,)).fetchone()
+        return row["at"] if row and row["at"] is not None else None
+
+    def trim_finished(self, kind: str) -> None:
+        """Cuts finished attempts of ``kind`` down to their first line: the
+        full text was only kept to recognise the turn, and Hermes's own
+        transcript has it."""
+        marks = ",".join("?" * len(FINAL))
+        with _lock, self._connect() as conn:
+            conn.execute(f"UPDATE attempts SET text = substr(text, 1, instr(text || char(10), char(10)) - 1) "
+                         f"WHERE kind=? AND state IN ({marks}) AND instr(text, char(10)) > 0", (kind, *FINAL))
+
+    def attempts_for_suffix(self, suffix: str) -> list[dict]:
+        """Attempts whose item id ends with ``suffix`` (a follow-up's attempts
+        each get a fresh id ending with its item), oldest first."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM attempts WHERE substr(item_id, -?) = ? ORDER BY created_at, attempt",
+                                (len(suffix), suffix)).fetchall()
+        return [dict(row) for row in rows]
+
+    def retire_attempts(self, suffix: str) -> None:
+        """Moves an item's attempts out of ``attempts_for_suffix``'s reach: a
+        follow-up's next news is sent and settled on its own attempts."""
+        with _lock, self._connect() as conn:
+            conn.execute("UPDATE attempts SET item_id = item_id || '-done' WHERE substr(item_id, -?) = ?",
+                         (len(suffix), suffix))
+
+    def attempts_since(self, kind: str, since: float) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM attempts WHERE kind=? AND created_at >= ? ORDER BY created_at",
+                                (kind, since)).fetchall()
+        return [dict(row) for row in rows]
+
+    def counts(self, kind: str) -> dict[str, int]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT state, COUNT(*) AS n FROM attempts WHERE kind=? GROUP BY state",
+                                (kind,)).fetchall()
+        return {row["state"]: row["n"] for row in rows}
+
+    # Report ratings -------------------------------------------------------
+
+    def set_ratings(self, attempt_id: str, items_json: str, ratings_json: str) -> bool:
+        """Stores a report's items and ratings; True when they changed. A
+        report split into cards takes none: it's rated on its cards."""
+        with _lock, self._connect() as conn:
+            if str(attempt_id) in _listed(conn, SPLIT_REPORTS):
+                return False
+            row = conn.execute("SELECT items_json, ratings_json FROM report_ratings WHERE attempt_id=?",
+                               (attempt_id,)).fetchone()
+            if row is not None and row["items_json"] == SPLIT_ITEMS:
+                return False
+            if row is not None and (row["items_json"], row["ratings_json"]) == (items_json, ratings_json):
+                return False
+            conn.execute(
+                "INSERT INTO report_ratings(attempt_id, items_json, ratings_json, updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(attempt_id) DO UPDATE SET items_json=excluded.items_json, "
+                "ratings_json=excluded.ratings_json, updated_at=excluded.updated_at",
+                (attempt_id, items_json, ratings_json, time.time()))
+        return True
+
+    def all_ratings(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM report_ratings ORDER BY attempt_id").fetchall()
+        return [dict(row) for row in rows]
+
+    # Outcomes (designs/proactivity.md 3.6) --------------------------------
+
+    def add_outcome(self, row: dict[str, Any]) -> None:
+        columns = ("at", "session_id", "turn_id", "task_id", "tool_call_id", "tool", "action", "label",
+                   "args_digest", "status", "error_type", "error", "ids_json", "duration_ms")
+        with _lock, self._connect() as conn:
+            conn.execute(f"INSERT INTO outcomes({', '.join(columns)}) VALUES({','.join('?' * len(columns))})",
+                         tuple(row[column] for column in columns))
+
+    def recent_outcomes(self, limit: int = 20, *, session_id: Optional[str] = None) -> list[dict]:
+        where, params = ("WHERE session_id=? ", (session_id,)) if session_id else ("", ())
+        with self._connect() as conn:
+            rows = conn.execute(f"SELECT * FROM outcomes {where}ORDER BY id DESC LIMIT ?",
+                                (*params, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def outcomes_between(self, session_id: str, start: float, end: float, limit: int = 50) -> list[dict]:
+        with self._connect() as conn:
+            # The latest win a cut: they sit nearest the rows they're shown with.
+            rows = conn.execute("SELECT * FROM outcomes WHERE session_id=? AND at >= ? AND at <= ? ORDER BY at DESC "
+                                "LIMIT ?", (session_id, start, end, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def outcome_counts(self, since: float) -> dict[str, int]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT status, COUNT(*) AS n FROM outcomes WHERE at >= ? GROUP BY status",
+                                (since,)).fetchall()
+        return {row["status"]: row["n"] for row in rows}
+
+    def prune_outcomes(self, *, before: float, keep: int) -> int:
+        """Drops outcomes older than ``before``, and the oldest past ``keep``."""
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            removed = conn.execute("DELETE FROM outcomes WHERE at < ?", (before,)).rowcount
+            removed += conn.execute("DELETE FROM outcomes WHERE id <= (SELECT id FROM outcomes ORDER BY id DESC "
+                                    "LIMIT 1 OFFSET ?)", (keep,)).rowcount
+            conn.execute("COMMIT")
+        return removed
+
+
+    # Memory (designs/pulse-slice-1.md) -----------------------------------
+
+    def watermark(self, profile: str, chat_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM watermarks WHERE profile=? AND chat_id=?",
+                               (profile, chat_id)).fetchone()
+        return dict(row) if row else None
+
+    def watermarks(self, marks: str = "watermarks", window: Optional[float] = None) -> list[dict]:
+        """Where each chat was read to; with ``window``, only that backfill window's marks."""
+        _check_marks(marks)
+        with self._connect() as conn:
+            if marks == "backfill_marks" and window is not None:
+                rows = conn.execute("SELECT * FROM backfill_marks WHERE window_from=?", (window,)).fetchall()
+            else:
+                rows = conn.execute(f"SELECT * FROM {marks}").fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _mark(conn: Any, marks: str, profile: str, chat_id: str, window: float) -> Optional[Any]:
+        row = conn.execute(f"SELECT * FROM {marks} WHERE profile=? AND chat_id=?", (profile, chat_id)).fetchone()
+        if row is not None and marks == "backfill_marks" and row["window_from"] != window:
+            conn.execute("DELETE FROM backfill_marks WHERE profile=? AND chat_id=?", (profile, chat_id))
+            return None  # another window's mark
+        return row
+
+    def clear_backfill_marks(self, keep_window: Optional[float] = None) -> None:
+        """Drops backfill marks; with ``keep_window``, all but that window's."""
+        with _lock, self._connect() as conn:
+            if keep_window is None:
+                conn.execute("DELETE FROM backfill_marks")
+            else:
+                conn.execute("DELETE FROM backfill_marks WHERE window_from!=?", (keep_window,))
+
+    def advance(self, profile: str, chat_id: str, *, message_id: int, at: float,
+                items: Sequence[dict[str, Any]] = (), closed: Sequence[dict[str, Any]] = (),
+                claims: Sequence[dict[str, Any]] = (), after_id: int = 0, marks: str = "watermarks",
+                window: float = 0.0) -> Optional[list[int]]:
+        """Records a read chunk: its items, the remembered items it repeats,
+        replaces or closes, Hermes's claims in it (pulse_claims.judge: one
+        kept before stays as it was), and the chat read up to row ``message_id``
+        (written at ``at``), in one transaction, so a chunk is never half
+        kept. Only if the chat was still read up to ``after_id``, so a chunk
+        two processes read is kept once. Returns the new items' ids, or None
+        when another reader got there first.
+
+        An item with ``same_as`` only brings that item's last mention (and a
+        due date it lacked, or the yearly date a fact said again gives) up to
+        date; one with ``replaces`` supersedes the
+        old item, which is kept with when and by what it stopped being true.
+        Nothing is deleted. ``marks`` names the table that says where the
+        chat was read to (MARKS), and ``window`` the backfill window's start.
+        A new item marked ``late`` (pulse_memory.LATE_S) is kept as expired.
+        An item ``closed`` closes whether open or reminded, and its cards get
+        Pulse's done mark in the same write (_mark_cards_done), so none is
+        left open behind it."""
+        _check_marks(marks)
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._mark(conn, marks, profile, chat_id, window)
+            if (row["message_id"] if row else 0) != after_id:
+                conn.execute("ROLLBACK")
+                return None
+            ids = _keep(conn, profile, chat_id, items, closed,
+                        lambda entry: f"chat {chat_id} message {entry['message_id']}: {entry['evidence']}")
+            conn.executemany(
+                "INSERT OR IGNORE INTO claims(chat_id, message_id, action, text, evidence, said_at, turn_from, "
+                "turn_to, backed_by, calls_json, kept_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                [(chat_id, claim["message_id"], claim["action"], claim["text"], claim["evidence"], claim["said_at"],
+                  claim["turn_from"], claim["turn_to"], claim["backed_by"], claim["calls_json"], claim["kept_at"])
+                 for claim in claims])
+            conn.execute(
+                f"INSERT INTO {marks}(profile, chat_id, message_id, at) VALUES(?,?,?,?) "
+                "ON CONFLICT(profile, chat_id) DO UPDATE SET message_id=excluded.message_id, at=excluded.at, "
+                "failures=0, retry_at=0", (profile, chat_id, message_id, at))
+            if marks == "backfill_marks":
+                conn.execute("UPDATE backfill_marks SET window_from=? WHERE profile=? AND chat_id=?",
+                             (window, profile, chat_id))
+            conn.execute("COMMIT")
+        return ids
+
+    def claims(self, limit: int = 50, *, unbacked: bool = False) -> list[dict]:
+        """Hermes's claims kept to judge (pulse_claims), the latest said
+        first; with ``unbacked``, only the ones no call backed."""
+        where = "WHERE backed_by='' " if unbacked else ""
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                f"SELECT * FROM claims {where}ORDER BY said_at DESC, id DESC LIMIT ?", (limit,))]
+
+    def prune_claims(self, before: float) -> int:
+        """Forgets the claims kept before ``before``."""
+        with _lock, self._connect() as conn:
+            return conn.execute("DELETE FROM claims WHERE kept_at < ?", (before,)).rowcount
+
+    def keep_inbox(self, *, mark: list, after: Optional[list], items: Sequence[dict[str, Any]] = (),
+                   closed: Sequence[dict[str, Any]] = ()) -> Optional[list[int]]:
+        """Records a read batch of the Shortcuts inbox (pulse_memory.read_inbox)
+        as ``advance`` records a chunk: its deadlines, the ones it repeats,
+        replaces or closes, and the inbox read up to ``mark`` (INBOX_MARK),
+        in one transaction, only if it was still read up to ``after`` and
+        the inbox is still read (INBOX_SETTING). Its items are this
+        profile's, with no chat. Returns the new items' ids, or None when
+        another reader got there first, or it was turned off meanwhile."""
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            stored = {row["key"]: row["value_json"] for row in conn.execute(
+                "SELECT key, value_json FROM settings WHERE key IN (?, ?)", (INBOX_MARK, INBOX_SETTING))}
+            try:
+                current = json.loads(stored[INBOX_MARK]) if INBOX_MARK in stored else None
+            except ValueError:
+                current = None
+            try:
+                reading = json.loads(stored[INBOX_SETTING]) if INBOX_SETTING in stored else True
+            except ValueError:
+                reading = True
+            if current != after or reading is False:
+                conn.execute("ROLLBACK")
+                return None
+            ids = _keep(conn, "", "", items, closed, lambda entry: f"inbox {entry['event']}: {entry['evidence']}")
+            conn.execute("INSERT INTO settings(key, value_json) VALUES(?, ?) "
+                         "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json", (INBOX_MARK, json.dumps(mark)))
+            conn.execute("COMMIT")
+        return ids
+
+    def chunk_failed(self, profile: str, chat_id: str, *, retry_at: float, after_id: int = 0,
+                     now: float = 0.0, marks: str = "watermarks", window: float = 0.0) -> int:
+        """Counts a failed read of the chat's next chunk, unless another
+        reader moved the chat past ``after_id`` or already counted a failure
+        that is still waiting for its retry; returns the count, or 0 when
+        it didn't count this one."""
+        _check_marks(marks)
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._mark(conn, marks, profile, chat_id, window)
+            if (row["message_id"] if row else 0) != after_id:
+                conn.execute("ROLLBACK")
+                return 0
+            if row and row["failures"] and row["retry_at"] > now:
+                conn.execute("ROLLBACK")
+                return 0  # another reader already counted this round's failure
+            conn.execute(
+                f"INSERT INTO {marks}(profile, chat_id, message_id, at, failures, retry_at) VALUES(?,?,0,0,1,?) "
+                "ON CONFLICT(profile, chat_id) DO UPDATE SET failures=failures+1, retry_at=excluded.retry_at",
+                (profile, chat_id, retry_at))
+            if marks == "backfill_marks":
+                conn.execute("UPDATE backfill_marks SET window_from=? WHERE profile=? AND chat_id=?",
+                             (window, profile, chat_id))
+            failures = conn.execute(f"SELECT failures FROM {marks} WHERE profile=? AND chat_id=?",
+                                    (profile, chat_id)).fetchone()["failures"]
+            conn.execute("COMMIT")
+        return failures
+
+    def open_items(self, kind: str = "", limit: int = -1, *, profile: Optional[str] = None,
+                   soonest: bool = False, stale_before: Optional[float] = None) -> list[dict]:
+        """Open items, most recently mentioned first, or with ``soonest``
+        dated ones soonest due first and then the rest. With ``stale_before``,
+        not the ones ``expire_items(due_before=stale_before)`` would close."""
+        where, params = "", []
+        if stale_before is not None:
+            where, params = where + "AND NOT (due_at IS NOT NULL AND due_at < ? AND mentioned_at < ?) ", \
+                params + [stale_before, stale_before]
+        if kind:
+            where, params = where + "AND kind=? ", params + [kind]
+        if profile is not None:
+            where, params = where + "AND profile=? ", params + [profile]
+        with self._connect() as conn:
+            rows = conn.execute(f"SELECT * FROM items WHERE status='open' AND superseded_at IS NULL {where}"
+                                f"ORDER BY {'due_at IS NULL, due_at, ' if soonest else ''}mentioned_at DESC, id DESC LIMIT ?",
+                                (*params, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def done_items(self, since: float, limit: int = 50, *, skip_kinds: Sequence[str] = (),
+                   skip_closer: str = "") -> list[dict]:
+        """Items closed as done at ``since`` or later and still current,
+        latest closed first (a close time stored as text, which SQLite
+        sorts after every number, isn't counted: it would be "since" for
+        ever): none of ``skip_kinds``, nor one ``skip_closer``
+        closed (it alone, or with a note after it: "told (…)")."""
+        kinds = ",".join("?" * len(skip_kinds))
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM items WHERE status='done' AND typeof(closed_at) IN ('integer', 'real') "
+                "AND closed_at>=? AND superseded_at IS NULL "
+                f"AND kind NOT IN ({kinds}) AND (?='' OR (closed_by IS NOT ? AND substr(closed_by, 1, ?) IS NOT ?)) "
+                "ORDER BY closed_at DESC, id DESC LIMIT ?",
+                (since, *skip_kinds, skip_closer, skip_closer, len(skip_closer) + 2, f"{skip_closer} (", limit))]
+
+    def yearly_facts(self, *, profile: Optional[str] = None) -> list[dict]:
+        """Open facts about a date that comes back every year (pulse_dates),
+        of ``profile``, or every profile's when None; oldest first."""
+        where, params = ("AND profile=? ", [profile]) if profile is not None else ("", [])
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                f"SELECT * FROM items WHERE status='open' AND superseded_at IS NULL AND kind='fact' "
+                f"AND every_year!='' {where}ORDER BY id", params)]
+
+    def deadlines(self) -> list[dict]:
+        """Open deadlines memory found in the Shortcuts inbox, soonest first."""
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM items WHERE status='open' AND superseded_at IS NULL AND from_inbox!='' "
+                "ORDER BY due_at, id")]
+
+    def inbox_items(self) -> list[dict]:
+        """Every item memory found in the Shortcuts inbox, whatever became of
+        it, for pulse_memory.forget_inbox."""
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT id, from_inbox, status, closed_at, superseded_at, superseded_by, valid_from FROM items "
+                "WHERE from_inbox!='' ORDER BY id")]
+
+    def items_from_inbox(self, device: Optional[str] = None, events: Optional[Sequence[str]] = None) -> list[int]:
+        """The items memory found in Shortcuts inbox events: ``events`` of
+        ``device``'s, all of ``device``'s, or every one (no device)."""
+        with self._connect() as conn:
+            if device is None:
+                rows = conn.execute("SELECT id FROM items WHERE from_inbox!=''").fetchall()
+            elif events is None:
+                rows = conn.execute("SELECT id FROM items WHERE substr(from_inbox, 1, ?)=?",
+                                    (len(device) + 1, f"{device}/")).fetchall()
+            else:
+                rows = []
+                refs = [f"{device}/{event}" for event in events]
+                for start in range(0, len(refs), 400):  # within SQLite's bound parameters
+                    chunk = refs[start:start + 400]
+                    rows += conn.execute(f"SELECT id FROM items WHERE from_inbox IN ({','.join('?' * len(chunk))})",
+                                         chunk).fetchall()
+        return sorted(row["id"] for row in rows)
+
+    def delete_items(self, ids: Sequence[int]) -> int:
+        """Deletes items memory found in the Shortcuts inbox, and their
+        follow-up rows (pulse_memory.forget_inbox); never an item from a
+        chat. The cards made from them stay, as what Pulse already said."""
+        gone = 0
+        for start in range(0, len(ids), 400):  # within SQLite's bound parameters
+            chunk = tuple(ids[start:start + 400])
+            marks = ",".join("?" * len(chunk))
+            with _lock, self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                found = [row["id"] for row in conn.execute(
+                    f"SELECT id FROM items WHERE id IN ({marks}) AND from_inbox!=''", chunk)]
+                if found:
+                    held = ",".join("?" * len(found))
+                    conn.execute(f"DELETE FROM followups WHERE item_id IN ({held})", found)
+                    conn.execute(f"DELETE FROM items WHERE id IN ({held})", found)
+                conn.execute("COMMIT")
+            gone += len(found)
+        return gone
+
+    def remembered_items(self, *, limit: Optional[int], reminded_since: float) -> list[dict]:
+        """What memory reads a chat beside: the open items, and the
+        commitments reminded since ``reminded_since``, which a chat can still
+        show done; most recently mentioned first. Every profile's: memory is
+        the user's, whichever profile's chat said it, and the report reads
+        it whole, so a thing said in two profiles' chats is one item
+        (notifier #550). ``limit`` None reads them all."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM items WHERE superseded_at IS NULL AND (status='open' "
+                                "OR (status='reminded' AND typeof(closed_at) IN ('integer', 'real') AND closed_at >= ?)) "
+                                "ORDER BY mentioned_at DESC, id DESC LIMIT ?",
+                                (reminded_since, -1 if limit is None else limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def expire_items(self, *, due_before: float, now: float) -> int:
+        """Open items due before ``due_before`` and not mentioned since."""
+        with _lock, self._connect() as conn:
+            return conn.execute(
+                "UPDATE items SET status='expired', closed_by='expiry', closed_at=? WHERE status='open' "
+                "AND superseded_at IS NULL AND due_at IS NOT NULL AND due_at < ? AND mentioned_at < ?",
+                (now, due_before, due_before)).rowcount
+
+    def close_item(self, item_id: int, *, status: str, closed_by: str) -> bool:
+        with _lock, self._connect() as conn:
+            changed = conn.execute(
+                "UPDATE items SET status=?, closed_by=?, closed_at=? WHERE id=? AND status='open' "
+                "AND superseded_at IS NULL",
+                (status, closed_by, time.time(), item_id)).rowcount
+        return bool(changed)
+
+    def current_item(self, item_id: int) -> Optional[int]:
+        """The open item standing for ``item_id`` now: itself, or what
+        replaced it; None once it's closed."""
+        with self._connect() as conn:
+            return _current(conn, item_id)
+
+    def item(self, item_id: int) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+        return dict(row) if row else None
+
+    def closed_since(self, item_id: int, since: float) -> bool:
+        """Whether ``item_id``, or what replaced it, closed at ``since`` or
+        later: done, cancelled or expired then (one closed before, a promise
+        Pulse told the user, say, doesn't count)."""
+        with self._connect() as conn:
+            for _ in range(MAX_CHAIN):
+                row = conn.execute("SELECT status, closed_at, superseded_by FROM items WHERE id=?",
+                                   (item_id,)).fetchone()
+                if row is None:
+                    return False
+                if row["status"] not in ("open", "reminded"):
+                    return close_time(row["closed_at"]) >= since
+                if row["superseded_by"] is None:
+                    return False
+                item_id = row["superseded_by"]
+        return False
+
+    # Follow-ups -------------------------------------------------------------
+
+    def add_followup(self, item_id: int, *, next_check_at: float, now: float, decision: str = "") -> None:
+        """A check schedule for an item that has none yet."""
+        with _lock, self._connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO followups(item_id, next_check_at, decision, created_at, updated_at) "
+                         "VALUES(?,?,?,?,?)", (item_id, next_check_at, decision, now, now))
+
+    def place_followup(self, item_id: int, *, next_check_at: float, now: float, decision: str) -> None:
+        """A check schedule waiting for the item's place (``decision``): a
+        new one, or one still waiting for its first or next check (as
+        sooner_followups brings closer), for an item a repeat named a place
+        for since."""
+        with _lock, self._connect() as conn:
+            conn.execute("INSERT INTO followups(item_id, next_check_at, decision, created_at, updated_at) "
+                         "VALUES(?,?,?,?,?) ON CONFLICT(item_id) DO UPDATE SET "
+                         "next_check_at=excluded.next_check_at, decision=excluded.decision, "
+                         "updated_at=excluded.updated_at WHERE followups.next_check_at IS NOT NULL "
+                         "AND followups.decision IN ('', 'wait', 'check failed')",
+                         (item_id, next_check_at, decision, now, now))
+
+    def end_followups(self, *, keep: set, now: float, only: Optional[int] = None) -> None:
+        """Stops checking items no longer open (``only``: just that one).
+        A follow-up waiting to be told, told or undelivered keeps its row."""
+        with _lock, self._connect() as conn:
+            rows = conn.execute("SELECT item_id FROM followups WHERE next_check_at IS NOT NULL"
+                                + (" AND item_id=?" if only is not None else ""),
+                                (only,) if only is not None else ()).fetchall()
+            for row in rows:
+                if row["item_id"] not in keep:
+                    conn.execute("UPDATE followups SET next_check_at=NULL, decision='closed', updated_at=? "
+                                 "WHERE item_id=?", (now, row["item_id"]))
+
+    def sooner_followups(self, factor: float, now: float) -> None:
+        """Brings every waiting check closer by ``factor`` (never before now)."""
+        with _lock, self._connect() as conn:
+            conn.execute("UPDATE followups SET next_check_at = ? + (next_check_at - ?) * ?, updated_at=? "
+                         "WHERE next_check_at > ? AND decision IN ('', 'wait', 'check failed')",
+                         (now, now, factor, now, now))
+
+    def followup(self, item_id: int) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM followups WHERE item_id=?", (item_id,)).fetchone()
+        return dict(row) if row else None
+
+    def due_followups(self, now: float) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM followups WHERE next_check_at IS NOT NULL AND next_check_at <= ? "
+                                "ORDER BY next_check_at", (now,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def decide_followup(self, item_id: int, *, decision: str, news: str, why: str, checks: int,
+                        next_check_at: Optional[float], now: float, failures: int = 0,
+                        timing: Optional[dict[str, Any]] = None) -> None:
+        """``failures``: checks failed in a row (any decision resets it).
+        ``timing``: when its news may push (pulse_followup.followup_timing),
+        kept as given; None clears it."""
+        with _lock, self._connect() as conn:
+            conn.execute("UPDATE followups SET decision=?, news=?, why=?, checks=?, failures=?, next_check_at=?, "
+                         "updated_at=?, timing=? WHERE item_id=?",
+                         (decision, news, why, checks, failures, next_check_at, now,
+                          json.dumps(timing, sort_keys=True) if timing else "", item_id))
+
+    def set_followup_pick(self, item_id: int, pick: str) -> None:
+        """The pick (pulse_picks, JSON; "" for none) of the news a check
+        just decided, which the follow-up's card keeps."""
+        with _lock, self._connect() as conn:
+            conn.execute("UPDATE followups SET pick=? WHERE item_id=?", (pick, item_id))
+
+    def followups_to_tell(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM followups WHERE decision='tell' ORDER BY updated_at").fetchall()
+        return [dict(row) for row in rows]
+
+    def followups(self, limit: int = 50) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM followups ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def followup_counts(self) -> dict[str, int]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT decision, COUNT(*) AS n FROM followups GROUP BY decision").fetchall()
+        return {(row["decision"] or "waiting"): row["n"] for row in rows}
+
+    # Moments (pulse_places) --------------------------------------------------
+
+    def add_moments(self, moments: Sequence[dict[str, Any]], now: float) -> list[str]:
+        """Keeps the arrivals and departures the location store passed on,
+        each once (a batch sent again adds nothing); the new ones' ids."""
+        added = []
+        with _lock, self._connect() as conn:
+            for moment in moments:
+                if conn.execute("INSERT OR IGNORE INTO moments(id, place_id, place, kind, event, at, received_at, "
+                                "keep, reach) VALUES(?,?,?,?,?,?,?,?,?)",
+                                (moment["id"], moment["place_id"], moment["place"], moment["kind"], moment["on"],
+                                 moment["at"], now, 1 if moment["keep"] else 0, moment.get("reach") or "")).rowcount:
+                    added.append(moment["id"])
+        return added
+
+    def new_moments(self) -> list[dict]:
+        """The moments not handled yet, oldest first."""
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM moments WHERE handled_at IS NULL ORDER BY at, id").fetchall()]
+
+    def moment_handled(self, moment_id: str, outcome: dict[str, Any], now: float) -> bool:
+        """Records what a moment did; False when it was handled already. One
+        from a phone that keeps no history keeps only its id and when, so
+        the same batch sent again adds nothing."""
+        with _lock, self._connect() as conn:
+            return bool(conn.execute(
+                "UPDATE moments SET handled_at=?, outcome=CASE WHEN keep THEN ? ELSE '' END, "
+                "place_id=CASE WHEN keep THEN place_id ELSE '' END, place=CASE WHEN keep THEN place ELSE '' END, "
+                "kind=CASE WHEN keep THEN kind ELSE '' END WHERE id=? AND handled_at IS NULL",
+                (now, json.dumps(outcome, sort_keys=True), moment_id)).rowcount)
+
+    def moments(self, since: float = 0.0, limit: int = 50) -> list[dict]:
+        """The moments kept that came at ``since`` or later, newest first
+        (`pulse where`)."""
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM moments WHERE place!='' AND received_at>=? ORDER BY at DESC, id DESC LIMIT ?",
+                (since, limit)).fetchall()]
+
+    def prune_moments(self, before: float) -> int:
+        with _lock, self._connect() as conn:
+            return conn.execute("DELETE FROM moments WHERE received_at < ?", (before,)).rowcount
+
+    def clear_moments(self, device: Optional[str] = None) -> int:
+        """Deletes every moment and shop walked into (Pulse or Where you are
+        turned off, or the location shared here wiped), or one device's
+        (that device wiped)."""
+        with _lock, self._connect() as conn:
+            if device is None:
+                conn.execute("DELETE FROM spot_entries")
+                return conn.execute("DELETE FROM moments").rowcount
+            conn.execute("DELETE FROM spot_entries WHERE device=?", (device,))
+            prefix = f"{device}/"
+            return conn.execute("DELETE FROM moments WHERE substr(id, 1, ?) = ?", (len(prefix), prefix)).rowcount
+
+    # Walking past (pulse_spots) ------------------------------------------------
+
+    def add_spot_entry(self, entry: dict[str, Any]) -> bool:
+        """Keeps a shop the phone said the user walked into, once (a batch
+        sent again adds nothing); whether it was new."""
+        with _lock, self._connect() as conn:
+            return bool(conn.execute(
+                "INSERT OR IGNORE INTO spot_entries(id, device, watch, query, name, at, received_at, distance_m, "
+                "accuracy_m, speed_mps, radius_m, depth_m, late_s, intent, confirmed, moment) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                tuple(entry.get(key) for key in ("id", "device", "watch", "query", "name", "at", "received_at",
+                                                 "distance_m", "accuracy_m", "speed_mps", "radius_m", "depth_m",
+                                                 "late_s", "intent", "confirmed", "moment"))).rowcount)
+
+    def spot_entries(self, limit: int = 50) -> list[dict]:
+        """The shops walked into, newest first (`pulse spots`)."""
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM spot_entries ORDER BY at DESC, id DESC LIMIT ?", (limit,)).fetchall()]
+
+    def clear_spot_entries(self) -> int:
+        """Forgets every shop come near (walking past turned off)."""
+        with _lock, self._connect() as conn:
+            return conn.execute("DELETE FROM spot_entries").rowcount
+
+    def prune_spot_entries(self, before: float) -> int:
+        with _lock, self._connect() as conn:
+            return conn.execute("DELETE FROM spot_entries WHERE received_at < ?", (before,)).rowcount
+
+    # Cards and lessons (pulse_learning) --------------------------------------
+
+    def add_card(self, row: dict[str, Any]) -> int:
+        _check_columns(row, CARD_COLUMNS)
+        with _lock, self._connect() as conn:
+            columns = ", ".join(row)
+            return int(conn.execute(f"INSERT INTO cards({columns}) VALUES({', '.join('?' * len(row))})",
+                                    tuple(row.values())).lastrowid)
+
+    def add_cards(self, rows: Sequence[dict[str, Any]], *, attempt: str = "", marks: Sequence[str] = (),
+                  keep: int = 50, links: Sequence[int] = (), updates: Sequence[tuple[int, dict[str, Any]]] = (),
+                  closes: Sequence[int] = (), now: Optional[float] = None) -> list[int]:
+        """Adds these cards in one transaction, all or none. With ``attempt``,
+        it's appended to each list setting in ``marks`` (the last ``keep``)
+        in the same write, so the mark can't be lost apart from the cards;
+        and an attempt any of them already holds adds nothing (another
+        process got there first). A report split into cards (SPLIT_REPORTS in
+        ``marks``) loses its typed ratings in the same write: it's rated on
+        its cards from then on, so an item counts once. ``links`` are the
+        journaled candidates the cards come from, one per row, noted on each
+        in the same write (pulse_candidates).
+
+        ``updates`` and ``closes`` are what picks did to open cards
+        (pulse_picks), in the same write: each update is a card id, the
+        columns it rewrites and, under "fallback", the row (and under
+        "link", the candidate) to add instead when that card closed
+        meanwhile; each close is a card id, marked done by INCIDENT unless
+        it's marked already. Ids returned: the added cards, then each
+        update's card, in order (the fallback's when it took its place)."""
+        for row in rows:
+            _check_columns(row, CARD_COLUMNS)
+        for _, change in updates:
+            _check_columns({k: v for k, v in change.items() if k not in ("fallback", "link")}, CARD_COLUMNS)
+            _check_columns(change["fallback"], CARD_COLUMNS)
+        if links and len(links) != len(rows):
+            raise ValueError(f"{len(links)} candidate links for {len(rows)} cards")
+        now = time.time() if now is None else now
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                lists = {key: _listed(conn, key) for key in (marks if attempt else ())}
+                if marks and attempt and any(attempt in listed for listed in lists.values()):
+                    conn.execute("ROLLBACK")
+                    return []
+                ids = [int(conn.execute(f"INSERT INTO cards({', '.join(row)}) VALUES({', '.join('?' * len(row))})",
+                                        tuple(row.values())).lastrowid) for row in rows]
+                conn.executemany("UPDATE candidates SET card_id=? WHERE id=?", list(zip(ids, links)))
+                for card_id, change in updates:
+                    fields = {k: v for k, v in change.items() if k not in ("fallback", "link")}
+                    if _card_open(conn, card_id):
+                        conn.execute(f"UPDATE cards SET {', '.join(f'{k}=?' for k in fields)}, updated_at=?, "
+                                     "seen_at=NULL WHERE id=?", (*fields.values(), now, card_id))
+                    else:
+                        row = change["fallback"]
+                        card_id = int(conn.execute(
+                            f"INSERT INTO cards({', '.join(row)}) VALUES({', '.join('?' * len(row))})",
+                            tuple(row.values())).lastrowid)
+                    if change.get("link") is not None:
+                        conn.execute("UPDATE candidates SET card_id=? WHERE id=?", (card_id, change["link"]))
+                    ids.append(card_id)
+                for card_id in closes:
+                    if _card_open(conn, card_id):
+                        conn.execute("INSERT INTO card_done(card_id, done_at, done_by, prior_json) VALUES(?,?,?,'{}')",
+                                     (card_id, now, INCIDENT))
+                        conn.execute("UPDATE card_acts SET check_at=NULL WHERE card_id=?", (card_id,))
+                if SPLIT_REPORTS in lists:
+                    # Its typed ratings go, and the row stays as a mark that
+                    # outlasts the trimmed list, so none are read back later.
+                    conn.execute(
+                        "INSERT INTO report_ratings(attempt_id, items_json, ratings_json, updated_at) "
+                        "VALUES(?, ?, '[]', ?) ON CONFLICT(attempt_id) DO UPDATE SET "
+                        "items_json=excluded.items_json, ratings_json='[]', updated_at=excluded.updated_at",
+                        (attempt, SPLIT_ITEMS, time.time()))
+                for key, value in lists.items():
+                    conn.execute("INSERT INTO settings(key, value_json) VALUES(?, ?) "
+                                 "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+                                 (key, json.dumps((value + [attempt])[-keep:])))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            return ids
+
+    def rated_cards(self, kind: str) -> list[dict]:
+        """``kind``'s cards the user rated useful or not: not "wrong time",
+        which rates when a card came, not the card."""
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT item_id, topic, rating, rated_at FROM cards WHERE kind=? AND rating!='' AND reason!=?",
+                (kind, WRONG_TIME))]
+
+    def card(self, card_id: int) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
+        return dict(row) if row else None
+
+    def touched_cards(self, limit: int) -> list[dict]:
+        """The cards made or last updated most recently (pulse_picks), newest
+        first, but those held for a moment."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM cards WHERE level!=? ORDER BY max(coalesce(updated_at, 0), created_at) DESC, "
+                                "id DESC LIMIT ?", (MOMENT, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def cards(self, limit: int = 100, without: Sequence[str] = ()) -> list[dict]:
+        """The newest cards, but those of the kinds in ``without`` and those
+        held for a moment (``moment_cards``), newest first: newest by their
+        last word, so one a pick updated lately is among them however old
+        (pulse_picks), listed by when it was made."""
+        clause = f" AND kind NOT IN ({','.join('?' * len(without))})" if without else ""
+        with self._connect() as conn:
+            rows = conn.execute(f"SELECT * FROM (SELECT * FROM cards WHERE level!=?{clause} "
+                                "ORDER BY max(coalesce(updated_at, 0), created_at) DESC, id DESC LIMIT ?) "
+                                "ORDER BY created_at DESC, id DESC", (MOMENT, *without, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def unseen_cards(self, without: Sequence[str] = ()) -> int:
+        clause = f" AND kind NOT IN ({','.join('?' * len(without))})" if without else ""
+        with self._connect() as conn:
+            return int(conn.execute(f"SELECT COUNT(*) FROM cards WHERE seen_at IS NULL AND level!=?{clause}",
+                                    (MOMENT, *without)).fetchone()[0])
+
+    def see_cards(self, ids: Optional[list[int]], now: float, without: Sequence[str] = ()) -> int:
+        """Marks cards seen: these, or every one ``cards`` gives but those
+        of the kinds in ``without`` when ``ids`` is None."""
+        with _lock, self._connect() as conn:
+            if ids is None:
+                clause = f" AND kind NOT IN ({','.join('?' * len(without))})" if without else ""
+                return conn.execute(f"UPDATE cards SET seen_at=? WHERE seen_at IS NULL AND level!=?{clause}",
+                                    (now, MOMENT, *without)).rowcount
+            if not ids:
+                return 0
+            return conn.execute(f"UPDATE cards SET seen_at=? WHERE seen_at IS NULL AND id IN ({','.join('?' * len(ids))})",
+                                (now, *ids)).rowcount
+
+    def card_for(self, kind: str, item_id: int, news: str) -> Optional[int]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT id FROM cards WHERE kind=? AND item_id=? AND news=?",
+                               (kind, item_id, news)).fetchone()
+        return int(row["id"]) if row else None
+
+    def card_for_message(self, kind: str, chat_id: str, message_id: int) -> Optional[int]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT id FROM cards WHERE kind=? AND chat_id=? AND message_id=?",
+                               (kind, chat_id, message_id)).fetchone()
+        return int(row["id"]) if row else None
+
+    def brought_by(self, brief: str) -> int:
+        """How many held cards the brief ``brief`` brought (stamped once it
+        was delivered: pulse_brief.settle)."""
+        with self._connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM cards WHERE brief=? AND kind!='brief'",
+                                    (brief,)).fetchone()[0])
+
+    def held_count(self) -> int:
+        with self._connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM cards WHERE level='brief' AND briefed_at IS NULL "
+                                    "AND dismissed_at IS NULL "
+                                    "AND id NOT IN (SELECT card_id FROM card_done)").fetchone()[0])
+
+    def held_cards(self, limit: int) -> list[dict]:
+        """Cards waiting for the morning brief, oldest first (not one the
+        user already marked done or swiped away)."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM cards WHERE level='brief' AND briefed_at IS NULL "
+                                "AND dismissed_at IS NULL AND id NOT IN (SELECT card_id FROM card_done) "
+                                "ORDER BY created_at, id LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def moment_cards(self) -> list[dict]:
+        """The cards held for a moment (pulse_places), oldest first, each
+        with ``done``: marked done while it waited (pulse_followup.
+        check_held)."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT *, id IN (SELECT card_id FROM card_done) AS done FROM cards WHERE level=? "
+                                "ORDER BY created_at, id", (MOMENT,)).fetchall()
+        return [{**dict(row), "done": bool(row["done"])} for row in rows]
+
+    def swap_card_moment(self, card_id: int, old: str, new: str) -> bool:
+        """Sets what a held card waits for (its ``moment``, JSON) if it's still
+        held and still ``old``; whether it did."""
+        with _lock, self._connect() as conn:
+            return conn.execute("UPDATE cards SET moment=? WHERE id=? AND level=? AND moment=?",
+                                (new, card_id, MOMENT, old)).rowcount > 0
+
+    def release_card(self, card_id: int, *, level: str, now: float, why: str, news: Optional[str] = None,
+                     looked: Optional[str] = None, fresh: bool = True) -> bool:
+        """Puts a card held for a moment on the screen at ``level``, its Why?
+        now ``why``, with ``news`` and ``looked`` when given (the turn that
+        brought it up said it); ``fresh``: as new, at the top of the list,
+        else where it was made, seen. What it waited for goes, so no place
+        or time the user was there stays on it. Whether it was still held."""
+        with _lock, self._connect() as conn:
+            return conn.execute(
+                "UPDATE cards SET level=?, why=?, news=COALESCE(?, news), looked=COALESCE(?, looked), moment='', "
+                "created_at=CASE WHEN ? THEN ? ELSE created_at END, "
+                "seen_at=CASE WHEN ? THEN NULL ELSE COALESCE(seen_at, ?) END WHERE id=? AND level=?",
+                (level, why, news, looked, fresh, now, fresh, now, card_id, MOMENT)).rowcount > 0
+
+    def found_cards(self, since: float) -> list[dict]:
+        """Report items Pulse found on its own (nothing remembered behind
+        them) since ``since`` that are on the screen: not held for the brief,
+        put away, rated not useful (Wrong time is only about when) or marked
+        done, and not tapped Do it on (its check reads the chat) or put back
+        with Undo after Pulse marked it; oldest first."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM cards WHERE kind=? AND item_id IS NULL AND created_at > ? "
+                                "AND NOT (level='brief' AND briefed_at IS NULL) AND level!='moment' "
+                                "AND dismissed_at IS NULL "
+                                "AND NOT (rating='down' AND reason!=?) AND id NOT IN (SELECT card_id FROM card_done) "
+                                "AND id NOT IN (SELECT card_id FROM card_acts) AND put_back_at IS NULL "
+                                "ORDER BY created_at, id", (NOTICED, since, WRONG_TIME)).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_done(self, card_id: int, item_id: Optional[int], *, closed_by: str, now: float,
+                  by: str = "user") -> bool:
+        """Marks a card done in one transaction: keeps what its item and
+        checks were (for Undo), closes an open, reminded or expired item as
+        done by ``closed_by`` (not a fact about a yearly date), stops its
+        checks and marks the card seen. A card with no item (a report item
+        Pulse found on its own) is only marked. False when it was marked
+        already."""
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM card_done WHERE card_id=?", (card_id,)).fetchone():
+                conn.execute("ROLLBACK")
+                return False
+            prior = _prior(conn, item_id) if item_id is not None else {}
+            conn.execute("INSERT INTO card_done(card_id, done_at, done_by, prior_json) VALUES(?,?,?,?)",
+                         (card_id, now, by, json.dumps(prior)))
+            conn.execute("UPDATE card_acts SET check_at=NULL WHERE card_id=?", (card_id,))
+            if item_id is not None:
+                # A fact about a yearly date stays: Done on a card drawn from it
+                # is about this year's, and the date comes round again.
+                conn.execute("UPDATE items SET status='done', closed_by=?, closed_at=? WHERE id=? "
+                             "AND status IN ('open', 'reminded', 'expired') AND superseded_at IS NULL "
+                             "AND NOT (kind='fact' AND every_year!='')",
+                             (closed_by, now, item_id))
+                conn.execute("UPDATE followups SET next_check_at=NULL, decision='closed', updated_at=? "
+                             "WHERE item_id=? AND next_check_at IS NOT NULL", (now, item_id))
+            conn.execute("UPDATE cards SET seen_at=COALESCE(seen_at, ?) WHERE id=?", (now, card_id))
+            if by == USER:
+                _put_signal(conn, card_id, prefs.DONE, at=now, useful=1.0, weight=prefs.DONE_WEIGHT)
+            conn.execute("COMMIT")
+        return True
+
+    def unmark_done(self, card_id: int, item_id: Optional[int], *, closed_by: Sequence[str], now: float) -> bool:
+        """Undo, in one transaction: takes the mark off and puts the item
+        back as it was while one of ``closed_by``, or the chat's close the
+        mark came with (its ``closer``, on the ``item`` it closed), still
+        holds it closed, and its checks back where the mark stopped them.
+        What the mark taught goes with it: the user's Done signal, and a Do
+        it Pulse saw done goes back to something sent (all the check saw
+        before it). A mark Pulse made, taken off, keeps the card as the user
+        left it: put_back_at. False with no mark."""
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT done_by, prior_json FROM card_done WHERE card_id=?", (card_id,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return False
+            conn.execute("DELETE FROM card_done WHERE card_id=?", (card_id,))
+            if row["done_by"] in (PULSE, INCIDENT):
+                conn.execute("UPDATE cards SET put_back_at=? WHERE id=?", (now, card_id))
+            conn.execute("DELETE FROM signals WHERE card_id=? AND what=?", (card_id, prefs.DONE))
+            conn.execute("UPDATE signals SET weight=MIN(weight, ?) WHERE card_id=? AND what=?",
+                         (prefs.ACT_SENT, card_id, prefs.ACT))
+            try:
+                prior = json.loads(row["prior_json"])
+            except ValueError:
+                prior = {}
+            prior = prior if isinstance(prior, dict) else {}
+            closers = [*closed_by, *([prior["closer"]] if isinstance(prior.get("closer"), str) else [])]
+            if isinstance(prior.get("item"), int) and not isinstance(prior["item"], bool):
+                item_id = prior["item"]  # the item a chat's close closed: the card's, or what replaced it
+            if isinstance(prior.get("status"), str):
+                conn.execute("UPDATE items SET status=?, closed_by=?, closed_at=? WHERE id=? "
+                             f"AND closed_by IN ({','.join('?' * len(closers))})",
+                             (prior["status"], str(prior.get("closed_by") or ""), prior.get("closed_at"),
+                              item_id, *closers))
+            if isinstance(prior.get("decision"), str) and prior["decision"] != "closed":
+                due = prior.get("next_check_at")
+                conn.execute("UPDATE followups SET decision=?, next_check_at=?, updated_at=? "
+                             "WHERE item_id=? AND decision='closed'",
+                             (prior["decision"], max(float(due), now) if isinstance(due, (int, float)) else None,
+                              now, item_id))
+            conn.execute("COMMIT")
+        return True
+
+    def done_marks(self, ids: list[int]) -> dict[int, dict]:
+        """Each of these cards' done mark ({done_at, done_by}), for the ones
+        marked."""
+        if not ids:
+            return {}
+        with self._connect() as conn:
+            rows = conn.execute("SELECT card_id, done_at, done_by FROM card_done "
+                                f"WHERE card_id IN ({','.join('?' * len(ids))})", tuple(ids)).fetchall()
+        return {int(row["card_id"]): {"done_at": float(row["done_at"]), "done_by": row["done_by"]} for row in rows}
+
+    def act_on_card(self, card_id: int, *, now: float, check_at: float,
+                    chat: Optional[tuple[str, str]] = None) -> None:
+        """Do it on a card: a check of its chat at ``check_at`` (a second Do it
+        starts over), and its signal, opened (one that got further keeps
+        how far it got). ``chat``: (profile, chat id) of the chat Do it used
+        for a card from no chat, when the app named one; a second Do it
+        without one goes back to the search by subject."""
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                profile, chat_id = chat if chat else (None, "")
+                conn.execute("INSERT INTO card_acts(card_id, acted_at, check_at, chat_profile, chat_id) "
+                             "VALUES(?,?,?,?,?) "
+                             "ON CONFLICT(card_id) DO UPDATE SET acted_at=excluded.acted_at, "
+                             "check_at=excluded.check_at, checks=0, outcome='', why='', "
+                             "chat_profile=excluded.chat_profile, chat_id=excluded.chat_id",
+                             (card_id, now, check_at, profile, chat_id))
+                _put_signal(conn, card_id, prefs.ACT, at=now, useful=1.0, weight=prefs.ACT_OPENED)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def due_acts(self, now: float) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM card_acts WHERE check_at IS NOT NULL AND check_at <= ? "
+                                "ORDER BY check_at", (now,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def act(self, card_id: int) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM card_acts WHERE card_id=?", (card_id,)).fetchone()
+        return dict(row) if row else None
+
+    def decide_act(self, card_id: int, *, acted_at: float, check_at: Optional[float], checks: int, outcome: str,
+                   why: str, stage: Optional[float] = None) -> bool:
+        """Only while the act is the one read (a new Do it meanwhile starts
+        over); whether it was. ``stage``: how far Do it got
+        (pulse_prefs.ACT_SENT, ACT_DONE), raised on its signal, never
+        lowered."""
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                changed = conn.execute("UPDATE card_acts SET check_at=?, checks=?, outcome=?, why=? "
+                                       "WHERE card_id=? AND acted_at=?",
+                                       (check_at, checks, outcome, why, card_id, acted_at)).rowcount
+                if changed and stage is not None:
+                    _put_signal(conn, card_id, prefs.ACT, at=acted_at, useful=1.0, weight=stage)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return changed > 0
+
+    def bring_back(self, card_id: int, *, level: str, back: str, acted_at: float, why: str, now: float) -> bool:
+        """A card whose Do it stalled, back as new at the top of the list
+        (pulse_followup.come_back): at ``level``, "brief" holding it for the
+        morning brief, its Why? now ``why``; whether it came back. Once: never
+        a card back before, nor one marked done, swiped away or rated down
+        since ("wrong time" aside: that's about timing, not usefulness)."""
+        held = level == "brief"
+        with _lock, self._connect() as conn:
+            return conn.execute(
+                "UPDATE cards SET back=?, back_acted_at=?, why=?, level=?, seen_at=NULL, created_at=?, "
+                "briefed_at=CASE WHEN ? THEN NULL ELSE briefed_at END, brief=CASE WHEN ? THEN '' ELSE brief END "
+                "WHERE id=? AND back='' AND dismissed_at IS NULL AND NOT (rating='down' AND reason!=?) "
+                "AND id NOT IN (SELECT card_id FROM card_done)",
+                (back, acted_at, why, level, now, held, held, card_id, WRONG_TIME)).rowcount > 0
+
+    def brief_cards(self, ids: list[int], now: float, brief: str = "") -> None:
+        """Stamps held cards as gone out in the brief ``brief``; one put away
+        or marked done while the brief was out stays held, so putting it back
+        brings it to the next brief."""
+        if not ids:
+            return
+        with _lock, self._connect() as conn:
+            conn.execute(f"UPDATE cards SET briefed_at=?, brief=? WHERE briefed_at IS NULL AND dismissed_at IS NULL "
+                         f"AND id NOT IN (SELECT card_id FROM card_done) "
+                         f"AND id IN ({','.join('?' * len(ids))})", (now, brief, *ids))
+
+    def dismiss_card(self, card_id: int, dismissed: bool, now: float, rest_until: Optional[float] = None) -> bool:
+        """Swipes a card away (and marks it seen), until ``rest_until`` when
+        one is given, or puts it back; whether it changed."""
+        with _lock, self._connect() as conn:
+            if dismissed:
+                return conn.execute("UPDATE cards SET dismissed_at=?, rest_until=?, seen_at=COALESCE(seen_at, ?) "
+                                    "WHERE id=? AND dismissed_at IS NULL", (now, rest_until, now, card_id)).rowcount > 0
+            return conn.execute("UPDATE cards SET dismissed_at=NULL, rest_until=NULL "
+                                "WHERE id=? AND dismissed_at IS NOT NULL", (card_id,)).rowcount > 0
+
+    def rested_cards(self, now: float) -> list[dict]:
+        """Cards swiped away until a time that has come, the earliest first."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM cards WHERE dismissed_at IS NOT NULL AND rest_until IS NOT NULL "
+                                "AND rest_until <= ? ORDER BY rest_until, id", (now,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def return_card(self, card_id: int, now: float, rest_until: Optional[float]) -> bool:
+        """A card swiped away comes back as new, at the top of the list;
+        whether it did. Only while ``rest_until`` is still its time: one put
+        back and swiped away again meanwhile keeps its new rest. Never one
+        marked done meanwhile: end_rest brings that one back as it is."""
+        with _lock, self._connect() as conn:
+            return conn.execute("UPDATE cards SET dismissed_at=NULL, rest_until=NULL, seen_at=NULL, created_at=? "
+                                "WHERE id=? AND dismissed_at IS NOT NULL AND rest_until IS ? "
+                                "AND id NOT IN (SELECT card_id FROM card_done)",
+                                (now, card_id, rest_until)).rowcount > 0
+
+    def end_rest(self, card_id: int, rest_until: Optional[float]) -> bool:
+        """A card swiped away until a time is back on the list as it was
+        (for one marked done meanwhile); whether it changed. Only while
+        ``rest_until`` is still its time, as return_card."""
+        with _lock, self._connect() as conn:
+            return conn.execute("UPDATE cards SET dismissed_at=NULL, rest_until=NULL "
+                                "WHERE id=? AND dismissed_at IS NOT NULL AND rest_until IS ?",
+                                (card_id, rest_until)).rowcount > 0
+
+    def stay_away(self, card_id: int, rest_until: Optional[float]) -> bool:
+        """A card swiped away until a time stays away for good instead (a
+        whole report found out of date, which Done and Undo don't take:
+        Put back still brings it back); whether it changed. Only while
+        ``rest_until`` is still its time, as return_card."""
+        with _lock, self._connect() as conn:
+            return conn.execute("UPDATE cards SET rest_until=NULL "
+                                "WHERE id=? AND dismissed_at IS NOT NULL AND rest_until IS ?",
+                                (card_id, rest_until)).rowcount > 0
+
+    def resting_items(self, now: float, rest_s: float) -> dict[int, float]:
+        """Remembered items a card of was swiped away and still rests: while
+        the card is away until a time (it comes back as new at that time,
+        or, its chat read first, a little after: return_card, end_rest), or
+        for ``rest_s`` after a Not now with no time; and when it was swiped
+        away (the latest)."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT item_id, MAX(dismissed_at) AS at FROM cards WHERE item_id IS NOT NULL "
+                                "AND dismissed_at IS NOT NULL AND ((rest_until IS NULL AND dismissed_at >= ?) "
+                                "OR rest_until IS NOT NULL) GROUP BY item_id", (now - rest_s,)).fetchall()
+        return {int(row["item_id"]): float(row["at"]) for row in rows}
+
+    def turn_cards(self, kind: Optional[str] = None) -> list[dict]:
+        """Each card's id, kind and news: ``kind``'s, or every card's."""
+        with self._connect() as conn:
+            if kind is None:
+                return [dict(row) for row in conn.execute("SELECT id, kind, news FROM cards")]
+            return [dict(row) for row in conn.execute("SELECT id, kind, news FROM cards WHERE kind=?", (kind,))]
+
+    def drop_cards(self, ids: Sequence[int]) -> int:
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        with _lock, self._connect() as conn:
+            dropped = conn.execute(f"DELETE FROM cards WHERE id IN ({marks})", tuple(ids)).rowcount
+            conn.execute(f"DELETE FROM card_done WHERE card_id IN ({marks})", tuple(ids))
+            conn.execute(f"DELETE FROM card_acts WHERE card_id IN ({marks})", tuple(ids))
+            return dropped
+
+    def prune_cards(self, keep: int, held_before: float = 0.0) -> int:
+        """Drops the oldest cards past ``keep``, but not one still held for the
+        brief or a moment unless it was made before ``held_before`` (no brief
+        for weeks). A card put away with Not now is no longer held."""
+        with _lock, self._connect() as conn:
+            dropped = conn.execute(
+                "DELETE FROM cards WHERE (NOT ((level='brief' AND briefed_at IS NULL AND dismissed_at IS NULL "
+                "AND id NOT IN (SELECT card_id FROM card_done)) OR level='moment') OR created_at < ?) AND id NOT IN "
+                "(SELECT id FROM cards ORDER BY max(coalesce(updated_at, 0), created_at) DESC, id DESC LIMIT ?)",
+                (held_before, keep)).rowcount
+            conn.execute("DELETE FROM card_done WHERE card_id NOT IN (SELECT id FROM cards)")
+            conn.execute("DELETE FROM card_acts WHERE card_id NOT IN (SELECT id FROM cards)")
+            return dropped
+
+    def rate_card(self, card: dict, *, rating: str, reason: str, now: float) -> bool:
+        """Rates ``card`` only if its rating is still the one read (another
+        process may have rated it since), with its thumb signal in the same
+        write; whether it did. The same thumb again (with or without a
+        reason) leaves the signal as it was, so the vote fades from when it
+        was first given. "Wrong time" says only the timing was wrong: no
+        thumb signal, and one the card had goes."""
+        counts = reason != WRONG_TIME
+        counted = card["rating"] in ("up", "down") and card["reason"] != WRONG_TIME
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rated = bool(conn.execute(
+                    "UPDATE cards SET rating=?, reason=?, rated_at=?, seen_at=COALESCE(seen_at, ?) "
+                    "WHERE id=? AND rating=? AND reason=?",
+                    (rating, reason, now, now, card["id"], card["rating"], card["reason"])).rowcount)
+                if rated and counts and (rating != card["rating"] or not counted):
+                    _put_signal(conn, card["id"], prefs.THUMB, at=now, useful=1.0 if rating == "up" else 0.0,
+                                weight=1.0)
+                elif rated and not counts and counted:
+                    conn.execute("DELETE FROM signals WHERE card_id=? AND what=?", (card["id"], prefs.THUMB))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return rated
+
+    def add_lesson(self, row: dict[str, Any], *, unless: Sequence[str] = (), limit: int = 0,
+                   changes_from: Optional[str] = None) -> Optional[int]:
+        """Adds a lesson; with ``limit``, only while fewer than that many in
+        force match its kind, what and the ``unless`` columns; with
+        ``changes_from`` (the value when none is in force), only when the
+        newest in force of its kind and what has another value. All are
+        checked in the same transaction, so two writers at once can't both
+        add one."""
+        _check_columns(row, LESSON_COLUMNS)
+        _check_columns(dict.fromkeys(unless), tuple(row))
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if limit:
+                match = ["kind", "what", *unless]
+                count = conn.execute("SELECT COUNT(*) FROM lessons WHERE undone_at IS NULL AND "
+                                     + " AND ".join(f"{column}=?" for column in match),
+                                     tuple(row[column] for column in match)).fetchone()[0]
+                if count >= limit:
+                    conn.execute("ROLLBACK")
+                    return None
+            if changes_from is not None:
+                newest = conn.execute("SELECT value FROM lessons WHERE undone_at IS NULL AND kind=? AND what=? "
+                                      "ORDER BY id DESC LIMIT 1", (row["kind"], row["what"])).fetchone()
+                current = newest["value"] if newest else changes_from
+                if current == row["value"]:
+                    conn.execute("ROLLBACK")
+                    return None
+            columns = ", ".join(row)
+            lesson_id = int(conn.execute(f"INSERT INTO lessons({columns}) VALUES({', '.join('?' * len(row))})",
+                                         tuple(row.values())).lastrowid)
+            conn.execute("COMMIT")
+        return lesson_id
+
+    def lessons(self, kind: Optional[str] = None, what: Optional[str] = None) -> list[dict]:
+        """The lessons still in force, oldest first."""
+        query, args = "SELECT * FROM lessons WHERE undone_at IS NULL", []
+        if kind is not None:
+            query, args = query + " AND kind=?", args + [kind]
+        if what is not None:
+            query, args = query + " AND what=?", args + [what]
+        with self._connect() as conn:
+            rows = conn.execute(query + " ORDER BY id", args).fetchall()
+        return [dict(row) for row in rows]
+
+    def undo_lesson(self, lesson_id: int, now: float) -> bool:
+        with _lock, self._connect() as conn:
+            return bool(conn.execute("UPDATE lessons SET undone_at=? WHERE id=? AND undone_at IS NULL",
+                                     (now, lesson_id)).rowcount)
+
+    # The report's candidate list (pulse_candidates) ---------------------------
+
+    def add_candidates(self, run_id: str, rows: Sequence[dict[str, Any]], *, now: float) -> list[int]:
+        """Journals a run's candidates; their ids, in order."""
+        for row in rows:
+            _check_columns(row, CANDIDATE_COLUMNS)
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                ids = _insert_candidates(conn, run_id, rows, now)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return ids
+
+    def finish_run(self, key: str, run: dict, rows: Sequence[dict[str, Any]], done: dict, *, now: float) -> bool:
+        """Journals a run's candidates and sets ``key`` to ``done``, in one
+        write and only while ``key`` still holds ``run``: a run given up on
+        meanwhile journals nothing."""
+        for row in rows:
+            _check_columns(row, CANDIDATE_COLUMNS)
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                found = conn.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
+                try:
+                    current = json.loads(found["value_json"]) if found else None
+                except ValueError:
+                    current = None
+                if current != run:
+                    conn.execute("ROLLBACK")
+                    return False
+                _insert_candidates(conn, run["id"], rows, now)
+                conn.execute("INSERT INTO settings(key, value_json) VALUES(?, ?) "
+                             "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json", (key, json.dumps(done)))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return True
+
+    def card_candidate(self, card_id: int) -> Optional[dict]:
+        """The journaled candidate a report card came from, while the journal
+        keeps it; None for one from before candidate lists, or pruned."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM candidates WHERE card_id=? ORDER BY id DESC LIMIT 1",
+                               (card_id,)).fetchone()
+        return dict(row) if row else None
+
+    def left_out(self, since: float, limit: int, on_the_way: str = "") -> list[dict]:
+        """The candidates journaled from ``since`` on that didn't come up,
+        newest first, each with the thing it is about (``things``) as
+        ``thing``, whether that thing came up (``_came_up_rows``, with what
+        report run ``on_the_way`` picked) in the same run or later as
+        ``later``, and as ``card_id`` the card it was brought up as
+        (``bring_up``), or another candidate about the same thing was,
+        however long ago (``_brought_rows``). A card that has been pruned
+        isn't named, since bringing the thing up would make another."""
+        with self._connect() as conn:
+            rows = [dict(row) for row in conn.execute(
+                "SELECT * FROM candidates WHERE created_at >= ? AND decision!='surfaced' "
+                "ORDER BY created_at DESC, id LIMIT ?", (since, limit))]
+            came = _came_up_rows(conn, since, on_the_way)
+            held = _brought_rows(conn)
+        thing = things([*rows, *came, *held])
+        came_up = _came_up(came, thing)
+        kept = {row["card_id"] for row in held}
+        brought: dict[Any, int] = {}
+        for row in held:
+            key = thing(row)
+            if key is not None:
+                brought.setdefault(key, row["card_id"])
+        for row in rows:
+            row["thing"] = thing(row)
+            if row["card_id"] not in kept:
+                row["card_id"] = brought.get(row["thing"])
+            row["later"] = came_up.get(row["thing"], -math.inf) >= row["created_at"]
+        return rows
+
+    def latest_candidate_at(self) -> Optional[float]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT MAX(created_at) FROM candidates").fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
+    def candidate(self, candidate_id: int) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+        return dict(row) if row else None
+
+    def bring_up(self, candidate_id: int, row: dict[str, Any], since: float,
+                 on_the_way: str = "") -> Optional[int]:
+        """Makes a card of a candidate that didn't come up (``row``, its
+        columns) and notes it on the candidate, in one write: its signals
+        carry the candidate's kind, place and band. The card it already has,
+        if another tap made one first (and it's still kept), or that another
+        candidate about the same thing was brought up as, however long ago,
+        which ``left_out`` names; None when the journal no longer has the
+        candidate, or the thing came up meanwhile, read as ``left_out``
+        reads it from ``since`` (and ``on_the_way``): it hides what came up,
+        but a list read before still offers it."""
+        _check_columns(row, CARD_COLUMNS)
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                found = conn.execute("SELECT item_id, text, created_at, card_id, "
+                                     "EXISTS(SELECT 1 FROM cards WHERE cards.id=candidates.card_id) "
+                                     "AS kept FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+                if found is None or (found["card_id"] is not None and found["kept"]):
+                    conn.execute("ROLLBACK")
+                    return None if found is None else int(found["card_id"])
+                came_up, made = _thing_since(conn, found, since, on_the_way)
+                if came_up or made is not None:
+                    conn.execute("ROLLBACK")
+                    return made
+                card_id = int(conn.execute(f"INSERT INTO cards({', '.join(row)}) VALUES({', '.join('?' * len(row))})",
+                                           tuple(row.values())).lastrowid)
+                conn.execute("UPDATE candidates SET card_id=? WHERE id=?", (card_id, candidate_id))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return card_id
+
+    def card_chat_title(self, profile: str, chat_id: str) -> str:
+        """The title the newest card from this chat gave it; "" for none."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT chat_title FROM cards WHERE profile=? AND chat_id=? AND chat_title!='' "
+                               "ORDER BY id DESC LIMIT 1", (profile, chat_id)).fetchone()
+        return row["chat_title"] if row else ""
+
+    def run_candidates(self, run_id: str) -> list[dict]:
+        """A run's candidates: its picks in their order, then the rest as listed."""
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM candidates WHERE run_id=? ORDER BY rank IS NULL, rank, id", (run_id,))]
+
+    def candidate_runs(self, limit: int) -> list[str]:
+        """The runs with candidates journaled, newest first."""
+        with self._connect() as conn:
+            return [row["run_id"] for row in conn.execute(
+                "SELECT run_id FROM candidates GROUP BY run_id ORDER BY MAX(id) DESC LIMIT ?", (limit,))]
+
+    def add_run(self, run_id: str, rows: Sequence[dict[str, Any]], cards: dict[int, dict[str, Any]], *,
+                now: float) -> list[int]:
+        """Journals a run's candidates and adds the cards its picks became
+        (``cards``: a row's place in ``rows``, its card), each linked to its
+        candidate, in one write: a look ahead (pulse_ahead) never journals a
+        pick without its card, or a card without its journal. The cards'
+        ids, in their rows' order."""
+        for row in rows:
+            _check_columns(row, CANDIDATE_COLUMNS)
+        for card in cards.values():
+            _check_columns(card, CARD_COLUMNS)
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                ids = _insert_candidates(conn, run_id, rows, now)
+                made = []
+                for n in sorted(cards):
+                    card = cards[n]
+                    card_id = int(conn.execute(f"INSERT INTO cards({', '.join(card)}) "
+                                               f"VALUES({', '.join('?' * len(card))})", tuple(card.values())).lastrowid)
+                    conn.execute("UPDATE candidates SET card_id=? WHERE id=?", (card_id, ids[n]))
+                    made.append(card_id)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return made
+
+    def ref_cards(self, refs: Sequence[str]) -> list[dict]:
+        """The cards candidates with one of ``refs`` made, each with its
+        candidate's ``ref``."""
+        refs = [ref for ref in dict.fromkeys(refs) if ref]
+        if not refs:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT cards.*, candidates.ref AS ref FROM candidates JOIN cards ON cards.id=candidates.card_id "
+                f"WHERE candidates.ref IN ({','.join('?' * len(refs))})", refs).fetchall()
+        return [dict(row) for row in rows]
+
+    def open_cards_about(self, item_ids: Sequence[int], refs: Sequence[str], kinds: Sequence[str]) -> list[dict]:
+        """The cards of ``kinds`` about any of ``item_ids`` (the card's item)
+        or ``refs`` (its candidate's) that are still open: not marked done,
+        not put away for good (one resting with Not now comes back) and not
+        rated not useful ("wrong time" only puts it off). Each with its
+        candidate's ``ref`` (None for none)."""
+        item_ids = list(dict.fromkeys(item_ids))
+        refs = [ref for ref in dict.fromkeys(refs) if ref]
+        if not (item_ids or refs) or not kinds:
+            return []
+        about = " OR ".join(clause for clause in (
+            f"cards.item_id IN ({','.join('?' * len(item_ids))})" if item_ids else "",
+            f"candidates.ref IN ({','.join('?' * len(refs))})" if refs else "") if clause)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT cards.*, candidates.ref AS ref FROM cards LEFT JOIN candidates ON candidates.card_id=cards.id "
+                f"WHERE ({about}) AND cards.kind IN ({','.join('?' * len(kinds))}) "
+                "AND cards.id NOT IN (SELECT card_id FROM card_done) "
+                "AND (cards.dismissed_at IS NULL OR cards.rest_until IS NOT NULL) "
+                "AND NOT (coalesce(cards.rating, '')='down' AND coalesce(cards.reason, '')!='wrong_time')",
+                (*item_ids, *refs, *kinds)).fetchall()
+        return [dict(row) for row in rows]
+
+    def open_cards_on(self, topics: Sequence[str], since: float) -> list[dict]:
+        """The "noticed" cards on any of ``topics`` made since ``since`` that
+        are still open, as open_cards_about counts it, each with its
+        candidate's ``ref`` (None for none)."""
+        topics = [topic for topic in dict.fromkeys(topics) if topic]
+        if not topics:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT cards.*, candidates.ref AS ref FROM cards LEFT JOIN candidates ON candidates.card_id=cards.id "
+                "WHERE cards.kind=? AND cards.created_at>=? "
+                f"AND cards.topic IN ({','.join('?' * len(topics))}) "
+                "AND cards.id NOT IN (SELECT card_id FROM card_done) "
+                "AND (cards.dismissed_at IS NULL OR cards.rest_until IS NOT NULL) "
+                "AND NOT (coalesce(cards.rating, '')='down' AND coalesce(cards.reason, '')!='wrong_time')",
+                (NOTICED, since, *topics)).fetchall()
+        return [dict(row) for row in rows]
+
+    def open_cards_with(self, subjects: Sequence[str], since: float) -> list[dict]:
+        """The open cards (follow-ups and report items) about any of
+        ``subjects`` (pulse_picks) made or updated since ``since``, newest first."""
+        subjects = [subject for subject in dict.fromkeys(subjects) if subject]
+        if not subjects:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM cards WHERE kind IN ('followup', ?) "
+                f"AND subject IN ({','.join('?' * len(subjects))}) AND max(coalesce(updated_at, 0), created_at)>=? "
+                "AND id NOT IN (SELECT card_id FROM card_done) "
+                "AND (dismissed_at IS NULL OR rest_until IS NOT NULL) "
+                "AND NOT (coalesce(rating, '')='down' AND coalesce(reason, '')!='wrong_time') "
+                "ORDER BY max(coalesce(updated_at, 0), created_at) DESC, id DESC",
+                (NOTICED, *subjects, since)).fetchall()
+        return [dict(row) for row in rows]
+
+    def bump_counts(self, key: str, day: str, names: Sequence[str], keep_days: int = 14) -> None:
+        """Adds one to each of ``names`` under ``day`` in the setting ``key``
+        ({day: {name: n}}), in one write, keeping the newest ``keep_days`` days."""
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                found = conn.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
+                try:
+                    days = json.loads(found["value_json"]) if found else {}
+                except ValueError:
+                    days = {}
+                days = days if isinstance(days, dict) else {}
+                today = days.get(day) if isinstance(days.get(day), dict) else {}
+                for name in names:
+                    held = today.get(name)
+                    today[name] = (held if isinstance(held, int) and not isinstance(held, bool) else 0) + 1
+                days[day] = today
+                days = {d: days[d] for d in sorted(days)[-keep_days:]}
+                conn.execute("INSERT INTO settings(key, value_json) VALUES(?, ?) "
+                             "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json", (key, json.dumps(days)))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def card_open(self, card_id: int) -> bool:
+        with self._connect() as conn:
+            return _card_open(conn, card_id)
+
+    def closed_cards_on(self, topics: Sequence[str], since: float) -> list[dict]:
+        """The "noticed" cards on any of ``topics`` the user closed since
+        ``since`` (however old the card): marked done, put away for good, or
+        rated not useful ("wrong time" only puts it off); each with its
+        candidate's ``ref``."""
+        topics = [topic for topic in dict.fromkeys(topics) if topic]
+        if not topics:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT cards.*, candidates.ref AS ref FROM cards LEFT JOIN candidates ON candidates.card_id=cards.id "
+                "WHERE cards.kind=? "
+                f"AND cards.topic IN ({','.join('?' * len(topics))}) "
+                "AND (cards.id IN (SELECT card_id FROM card_done WHERE done_at>=? AND done_by!='incident') "
+                "OR (cards.dismissed_at IS NOT NULL AND cards.rest_until IS NULL AND cards.dismissed_at>=?) "
+                "OR (coalesce(cards.rating, '')='down' AND coalesce(cards.reason, '')!='wrong_time' "
+                "AND coalesce(cards.rated_at, cards.created_at)>=?))",
+                (NOTICED, *topics, since, since, since)).fetchall()
+        return [dict(row) for row in rows]
+
+    def away_refs(self, prefix: str) -> set[str]:
+        """The refs starting with ``prefix`` whose candidates made a card the
+        user put away for good (dismissed with no rest) or rated not
+        useful ("wrong time" only puts it off)."""
+        with self._connect() as conn:
+            return {row["ref"] for row in conn.execute(
+                "SELECT DISTINCT candidates.ref AS ref FROM candidates JOIN cards ON cards.id=candidates.card_id "
+                "WHERE substr(candidates.ref, 1, ?)=? AND ((cards.rating='down' AND cards.reason!='wrong_time') OR "
+                "(cards.dismissed_at IS NOT NULL AND cards.rest_until IS NULL))", (len(prefix), prefix))}
+
+    def journaled_refs(self, refs: Sequence[str]) -> set[str]:
+        """Which of ``refs`` a candidate in the journal carries."""
+        refs = [ref for ref in dict.fromkeys(refs) if ref]
+        if not refs:
+            return set()
+        with self._connect() as conn:
+            return {row["ref"] for row in conn.execute(
+                f"SELECT DISTINCT ref FROM candidates WHERE ref IN ({','.join('?' * len(refs))})", refs)}
+
+    def release_held(self, run_prefix: str, before: float) -> int:
+        """Puts on the screen (level ``screen``) the cards held for the
+        morning brief that runs whose id starts with ``run_prefix`` made
+        before ``before`` and no brief took: a look ahead's are for that
+        day's brief only. How many."""
+        with _lock, self._connect() as conn:
+            return conn.execute(
+                "UPDATE cards SET level='screen' WHERE level='brief' AND briefed_at IS NULL AND created_at < ? "
+                "AND id IN (SELECT card_id FROM candidates WHERE card_id IS NOT NULL AND substr(run_id, 1, ?)=?)",
+                (before, len(run_prefix), run_prefix)).rowcount
+
+    # What the user did with cards (pulse_prefs) ------------------------------
+
+    def signals(self, since: float = 0.0) -> list[dict]:
+        """The signals from ``since`` on, oldest first."""
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute("SELECT * FROM signals WHERE at >= ? ORDER BY at, card_id, what",
+                                                      (since,))]
+
+    def learned(self, now: float) -> prefs.Learned:
+        """What the signals add up to at ``now`` (pulse_prefs.learn), without
+        what the resets in force forgot, fitted again only once either
+        changes or LEARNED_FOR_S goes by: the tick asks every half minute
+        while a follow-up waits to go out."""
+        since = now - prefs.KEEP_S
+        with self._connect() as conn:
+            rows = [dict(row) for row in conn.execute("SELECT * FROM signals WHERE at >= ? ORDER BY at, card_id, what",
+                                                      (since,))]
+            resets = tuple((row["kind"], row["value"], float(row["created_at"])) for row in conn.execute(
+                "SELECT kind, value, created_at FROM lessons WHERE what=? AND undone_at IS NULL ORDER BY id",
+                (RESET,)))
+        if not rows and not resets:
+            # Nothing to fit and nothing to keep. A host that never turned
+            # Pulse on reads through a scratch store with a path of its
+            # own, which would leave the cache an entry heavier per read.
+            return prefs.learn(rows, now, resets)
+        # From the rows just read, not read again: the fit and what the
+        # cache says it was fitted from are then the same signals.
+        totals = (len(rows), sum(row["at"] or 0 for row in rows), sum(row["useful"] or 0 for row in rows),
+                  sum(row["weight"] or 0 for row in rows))
+        kept = _learned.get(str(self.path))
+        if kept is not None and kept[0] == (totals, resets) and 0 <= now - kept[1] < LEARNED_FOR_S:
+            return kept[2]
+        fitted = prefs.learn(rows, now, resets)
+        _learned[str(self.path)] = ((totals, resets), now, fitted)
+        return fitted
+
+    def prune_signals(self, before: float) -> int:
+        with _lock, self._connect() as conn:
+            return conn.execute("DELETE FROM signals WHERE at < ?", (before,)).rowcount
+
+    def prune_candidates(self, before: float) -> int:
+        """Drops the candidates journaled before ``before``; how many went."""
+        with _lock, self._connect() as conn:
+            return conn.execute("DELETE FROM candidates WHERE created_at < ?", (before,)).rowcount
+
+    def item_counts(self) -> dict[str, int]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT kind, COUNT(*) AS n FROM items WHERE status='open' AND superseded_at IS NULL "
+                                "GROUP BY kind").fetchall()
+        return {row["kind"]: row["n"] for row in rows}
+
+
+def _signal_attrs(conn: sqlite3.Connection, card_id: int) -> Optional[dict[str, Any]]:
+    """What a card's signals carry: its kind, place and band as it came up
+    (from its candidate when the journal still has it, else as the card's
+    earlier signals had them, else as the card kept them), and when it was
+    pushed, if it was. None for a card that takes none (a report or brief as
+    a whole)."""
+    card = conn.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
+    if card is None or card["kind"] not in ("followup", NOTICED):
+        return None
+    pushed = float(card["created_at"]) if card["level"] == "push" else None
+    found = conn.execute("SELECT * FROM candidates WHERE card_id=? ORDER BY id DESC LIMIT 1", (card_id,)).fetchone()
+    if found is not None:
+        return {"kind": found["kind"], "pushed": pushed,
+                "place": found["place"] or prefs.place(found["profile"], found["chat_id"], found["area"], found["source"]),
+                "band": found["band"] or prefs.band(found["due_at"], float(found["created_at"]))}
+    # The journal keeps thirty days: a Done weeks after a thumb counts for what the thumb did.
+    kept = conn.execute("SELECT kind, place, band FROM signals WHERE card_id=? LIMIT 1", (card_id,)).fetchone()
+    if kept is not None:
+        return {"kind": kept["kind"], "place": kept["place"], "band": kept["band"], "pushed": pushed}
+    if card["band"]:
+        # Kept on the card as it came up (0.84.0), for a first signal after the journal let its candidate go.
+        return {"kind": "followup" if card["kind"] == "followup" else card["topic"] or "other",
+                "place": card["place"], "band": card["band"], "pushed": pushed}
+    item = conn.execute("SELECT due_at FROM items WHERE id=?", (card["item_id"],)).fetchone() \
+        if card["item_id"] is not None else None
+    band = prefs.band(item["due_at"], float(card["created_at"])) if item is not None else ""
+    if card["kind"] == "followup":
+        return {"kind": "followup", "place": prefs.place(card["profile"], card["chat_id"]), "band": band,
+                "pushed": pushed}
+    # A report item whose candidate the journal no longer has, or never had: its chat when it's about
+    # something remembered or was found in one (it points there, with no message of Pulse's turn).
+    in_chat = card["item_id"] is not None or bool(card["chat_id"]) and card["message_id"] is None
+    return {"kind": card["topic"] or "other", "band": band, "pushed": pushed,
+            "place": prefs.place(card["profile"], card["chat_id"]) if in_chat else ""}
+
+
+def _put_signal(conn: sqlite3.Connection, card_id: int, what: str, *, at: float, useful: float,
+                weight: float) -> None:
+    """Keeps a card's signal of one kind: a thumb or Done replaces the one
+    before; Do it keeps the furthest it got and when it was first done.
+    Nothing for a card that takes none."""
+    attrs = _signal_attrs(conn, card_id)
+    if attrs is None:
+        return
+    keep = ("at=MIN(at, excluded.at), weight=MAX(weight, excluded.weight)" if what == prefs.ACT
+            else "at=excluded.at, useful=excluded.useful, weight=excluded.weight")
+    conn.execute("INSERT INTO signals(card_id, what, at, useful, weight, kind, place, band, pushed) "
+                 f"VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(card_id, what) DO UPDATE SET {keep}",
+                 (card_id, what, at, useful, weight, attrs["kind"], attrs["place"], attrs["band"], attrs["pushed"]))
+
+
+def _signal_gaps(conn: sqlite3.Connection, since: float) -> dict[str, list[sqlite3.Row]]:
+    """Where the signals of the cards the store still has differ from what
+    the cards say, from ``since`` on: a store from before signals were kept,
+    or a process from before still running, writes ratings, Do its, Dones
+    and Undos without them. "thumb": cards rated without their thumb (or
+    with the other one), but for "wrong time", which keeps none; "act": Do
+    its without theirs; "done": the user's Dones without theirs; "undone":
+    Done signals whose Done was undone; "unmarked": Do its kept as done,
+    though the mark Pulse made of it was undone. Only cards that take
+    signals (follow-ups and report items)."""
+    kinds = ("followup", NOTICED)
+    return {
+        "thumb": conn.execute(
+            "SELECT c.id, c.rating, COALESCE(c.rated_at, c.created_at) AS at FROM cards c "
+            "LEFT JOIN signals s ON s.card_id=c.id AND s.what=? WHERE c.kind IN (?, ?) "
+            "AND c.rating IN ('up', 'down') AND c.reason != ? AND COALESCE(c.rated_at, c.created_at) >= ? "
+            "AND (s.card_id IS NULL OR s.useful != (CASE c.rating WHEN 'up' THEN 1.0 ELSE 0.0 END))",
+            (prefs.THUMB, *kinds, WRONG_TIME, since)).fetchall(),
+        "act": conn.execute(
+            "SELECT a.* FROM card_acts a JOIN cards c ON c.id=a.card_id "
+            "LEFT JOIN signals s ON s.card_id=a.card_id AND s.what=? "
+            "WHERE c.kind IN (?, ?) AND a.acted_at >= ? AND s.card_id IS NULL",
+            (prefs.ACT, *kinds, since)).fetchall(),
+        "done": conn.execute(
+            "SELECT d.card_id, d.done_at FROM card_done d JOIN cards c ON c.id=d.card_id "
+            "LEFT JOIN signals s ON s.card_id=d.card_id AND s.what=? "
+            "WHERE d.done_by=? AND c.kind IN (?, ?) AND d.done_at >= ? AND s.card_id IS NULL",
+            (prefs.DONE, USER, *kinds, since)).fetchall(),
+        "undone": conn.execute(
+            "SELECT s.card_id FROM signals s JOIN cards c ON c.id=s.card_id WHERE s.what=? "
+            "AND NOT EXISTS (SELECT 1 FROM card_done d WHERE d.card_id=s.card_id AND d.done_by=?)",
+            (prefs.DONE, USER)).fetchall(),
+        "unmarked": conn.execute(
+            "SELECT s.card_id FROM signals s JOIN card_acts a ON a.card_id=s.card_id "
+            "WHERE s.what=? AND s.weight > ? AND a.outcome='done' "
+            "AND NOT EXISTS (SELECT 1 FROM card_done d WHERE d.card_id=s.card_id)",
+            (prefs.ACT, prefs.ACT_SENT)).fetchall(),
+    }
+
+
+def _sync_signals(conn: sqlite3.Connection, gaps: dict[str, list[sqlite3.Row]]) -> None:
+    """Closes ``_signal_gaps``: a rating, Do it or Done without its signal
+    gets it, as it would have then; an undone Done's signal goes, and a Do
+    it Pulse saw done whose mark was undone goes back to something sent, as
+    Undo does now (``unmark_done``). A Do it counts by how far its check got:
+    done while Pulse's mark of it stands, something sent once a check ran or
+    the chat kept going, else opened."""
+    for card in gaps["thumb"]:
+        _put_signal(conn, card["id"], prefs.THUMB, at=float(card["at"]),
+                    useful=1.0 if card["rating"] == "up" else 0.0, weight=1.0)
+    marked = {row["card_id"] for row in conn.execute("SELECT card_id FROM card_done WHERE done_by != ?", (USER,))}
+    for act in gaps["act"]:
+        stage = (prefs.ACT_DONE if act["outcome"] == "done" and act["card_id"] in marked
+                 else prefs.ACT_SENT if act["checks"] or act["why"] == "the chat kept going" else prefs.ACT_OPENED)
+        _put_signal(conn, act["card_id"], prefs.ACT, at=float(act["acted_at"]), useful=1.0, weight=stage)
+    for done in gaps["done"]:
+        _put_signal(conn, done["card_id"], prefs.DONE, at=float(done["done_at"]), useful=1.0,
+                    weight=prefs.DONE_WEIGHT)
+    for row in gaps["undone"]:
+        conn.execute("DELETE FROM signals WHERE card_id=? AND what=?", (row["card_id"], prefs.DONE))
+    for row in gaps["unmarked"]:
+        conn.execute("UPDATE signals SET weight=? WHERE card_id=? AND what=?",
+                     (prefs.ACT_SENT, row["card_id"], prefs.ACT))
+
+
+def same_text(text: str) -> str:
+    """A candidate's text spaced and cased alike, so the same thing found
+    twice reads as one."""
+    return " ".join(text.split()).casefold()
+
+
+def same_thing(row: Any) -> list[tuple[str, Any]]:
+    """What a candidate is about: its remembered item, and its text."""
+    keys: list[tuple[str, Any]] = [("item", row["item_id"])] if row["item_id"] is not None else []
+    text = same_text(row["text"] or "")
+    return keys + [("text", text)] if text else keys
+
+
+def things(rows: Sequence[Any]) -> Callable[[Any], Optional[tuple[str, Any]]]:
+    """The thing each of ``rows`` is about, as a key its rows share (None for
+    a row with neither item nor text): rows sharing a remembered item or a
+    text (``same_thing``) are one thing, and so is every row joined to them
+    that way, so an item whose words changed between reports, and words a
+    report found on their own, are still the one thing."""
+    parent: dict[tuple[str, Any], tuple[str, Any]] = {}
+
+    def root(key: tuple[str, Any]) -> tuple[str, Any]:
+        while parent.setdefault(key, key) != key:
+            parent[key] = key = parent[parent[key]]
+        return key
+
+    for row in rows:
+        keys = same_thing(row)
+        for key in keys[1:]:
+            parent[root(key)] = root(keys[0])
+
+    def thing(row: Any) -> Optional[tuple[str, Any]]:
+        keys = same_thing(row)
+        return root(keys[0]) if keys else None
+    return thing
+
+
+def _came_up(came: Sequence[Any], thing: Callable[[Any], Optional[tuple[str, Any]]]) -> dict[Any, float]:
+    """When each thing last came up, by what came up (``_came_up_rows``)."""
+    came_up: dict[Any, float] = {}
+    for row in came:
+        key = thing(row)
+        if key is not None:
+            came_up[key] = max(came_up.get(key, row["created_at"]), row["created_at"])
+    return came_up
+
+
+def _came_up_rows(conn: sqlite3.Connection, since: float, on_the_way: str) -> list[Any]:
+    """What came up from ``since`` on, as rows ``things`` reads: the
+    candidates reports brought up as cards, and those report run
+    ``on_the_way`` picked, whose cards are on their way (what a report that
+    was dropped, or that Hermes refused, picked never came up), and the
+    cards no candidate made (a report sent without its candidate list, a
+    follow-up), by their item and words."""
+    return [*conn.execute("SELECT item_id, text, created_at FROM candidates WHERE created_at >= ? "
+                          "AND decision='surfaced' AND (card_id IS NOT NULL OR run_id=?)", (since, on_the_way)),
+            *conn.execute("SELECT item_id, news AS text, created_at FROM cards WHERE created_at >= ? AND id NOT IN "
+                          "(SELECT card_id FROM candidates WHERE card_id IS NOT NULL)", (since,))]
+
+
+def _brought_rows(conn: sqlite3.Connection) -> list[Any]:
+    """The candidates brought up (``bring_up``) as a card Pulse still keeps,
+    newest first, as far back as the journal goes: a thing brought up from
+    an older report's list is still that card when the latest leaves it out
+    again."""
+    return conn.execute("SELECT item_id, text, card_id FROM candidates WHERE decision!='surfaced' "
+                        "AND card_id IN (SELECT id FROM cards) ORDER BY created_at DESC, id").fetchall()
+
+
+def _thing_since(conn: sqlite3.Connection, found: Any, since: float,
+                 on_the_way: str) -> tuple[bool, Optional[int]]:
+    """For the thing candidate ``found`` is about, read from ``since`` (or
+    from ``found``, if older) as ``left_out`` reads it: whether it came up in
+    ``found``'s own run or later, which ``left_out`` leaves out as ``later``,
+    and the kept card another candidate about it was brought up as, however
+    long ago."""
+    since = min(since, found["created_at"])
+    rows = conn.execute("SELECT item_id, text FROM candidates WHERE created_at >= ? AND decision!='surfaced'",
+                        (since,)).fetchall()
+    came = _came_up_rows(conn, since, on_the_way)
+    held = _brought_rows(conn)
+    thing = things([*rows, *came, *held, found])
+    key = thing(found)
+    if key is None:
+        return False, None
+    if _came_up(came, thing).get(key, -math.inf) >= found["created_at"]:
+        return True, None
+    return False, next((int(row["card_id"]) for row in held if thing(row) == key), None)
+
+
+def _insert_candidates(conn: sqlite3.Connection, run_id: str, rows: Sequence[dict[str, Any]], now: float) -> list[int]:
+    return [int(conn.execute(f"INSERT INTO candidates(run_id, created_at, {', '.join(row)}) "
+                             f"VALUES(?, ?, {', '.join('?' * len(row))})", (run_id, now, *row.values())).lastrowid)
+            for row in rows]
+
+
+ITEM_COLUMNS = ("profile", "chat_id", "message_id", "kind", "text", "evidence", "explicit", "due", "due_at",
+                "mentioned_at", "recorded_at", "valid_from", "every_year", "occasion", "from_inbox", "sender",
+                "place_words", "place_on")
+
+
+def _keep(conn: sqlite3.Connection, profile: str, chat_id: str, items: Sequence[dict[str, Any]],
+          closed: Sequence[dict[str, Any]], closer: Callable[[dict[str, Any]], str]) -> list[int]:
+    """What ``advance`` and ``keep_inbox`` write, inside their transaction:
+    the new items, the ones they repeat or replace, and the ones they close
+    (``closer`` says what closed each); the new items' ids. A new item is
+    ``profile``'s; the ones it repeats, replaces or closes may be any
+    profile's (remembered_items)."""
+    live = "status='open' AND superseded_at IS NULL"
+    now, ids = time.time(), []
+    for item in items:
+        item = {"every_year": "", "occasion": "", "from_inbox": "", "sender": "", "place_words": "", "place_on": "",
+                **item}
+        if item.get("same_as"):
+            # A repeat of an item replaced since it was shown repeats its successor;
+            # one of an item closed since is already on record.
+            target = _current(conn, item["same_as"])
+            if target is None or conn.execute(
+                    # A date said again, or a later one, moves the item's date. A
+                    # yearly one (a fact's) is kept as said this time, and takes the
+                    # place of a due date, so the fact no longer expires; a fact
+                    # already yearly takes no due date from a repeat. A place said
+                    # again is where it waits now (pulse_followup.schedule).
+                    f"UPDATE items SET mentioned_at=MAX(mentioned_at, ?), "
+                    f"due=CASE WHEN ?!='' THEN '' "
+                    f"WHEN every_year='' AND ? IS NOT NULL AND (due_at IS NULL OR ? > due_at) THEN ? "
+                    f"ELSE due END, "
+                    f"due_at=CASE WHEN ?!='' THEN NULL "
+                    f"WHEN every_year='' AND ? IS NOT NULL AND (due_at IS NULL OR ? > due_at) THEN ? "
+                    f"ELSE due_at END, "
+                    f"every_year=CASE WHEN ?!='' THEN ? ELSE every_year END, "
+                    f"occasion=CASE WHEN ?!='' THEN ? ELSE occasion END, "
+                    f"place_on=CASE WHEN ?!='' THEN ? ELSE place_on END, "
+                    f"place_words=CASE WHEN ?!='' THEN ? ELSE place_words END "
+                    f"WHERE id=? AND {live}",
+                    (item["mentioned_at"], item["every_year"], item["due_at"], item["due_at"], item["due"],
+                     item["every_year"], item["due_at"], item["due_at"], item["due_at"],
+                     item["every_year"], item["every_year"], item["every_year"], item["occasion"],
+                     item["place_words"], item["place_on"], item["place_words"], item["place_words"],
+                     target)).rowcount:
+                continue
+        row = {**item, "profile": profile, "chat_id": chat_id, "recorded_at": now, "valid_from": item["mentioned_at"]}
+        new_id = conn.execute(
+            f"INSERT INTO items({', '.join(ITEM_COLUMNS)}) VALUES({','.join('?' * len(ITEM_COLUMNS))})",
+            tuple(row[column] for column in ITEM_COLUMNS)).lastrowid
+        ids.append(new_id)
+        if item.get("late"):  # learned after its time had passed: too late to remind
+            conn.execute("UPDATE items SET status='expired', closed_by=?, closed_at=? WHERE id=?",
+                         (LATE_BY, now, new_id))
+        # Already replaced (by an earlier chunk): replace its successor.
+        target = _current(conn, item["replaces"]) if item.get("replaces") else None
+        if target is not None and target != new_id:
+            conn.execute(f"UPDATE items SET superseded_at=?, superseded_by=?, valid_to=? WHERE id=? AND {live}",
+                         (now, new_id, item["mentioned_at"], target))
+    for entry in closed:  # an item replaced since closes through its successor
+        target = _current(conn, entry["id"], reminded=True)
+        if target is None:
+            continue
+        said = closer(entry)
+        prior = _prior(conn, target)
+        if conn.execute("UPDATE items SET status=?, closed_by=?, closed_at=? WHERE id=? "
+                        "AND status IN ('open', 'reminded') AND superseded_at IS NULL",
+                        (entry["status"], said, now, target)).rowcount:
+            # Undo puts the item back while this close still holds it,
+            # from a card about an item it replaced too.
+            _mark_cards_done(conn, target, prior={**prior, "closer": said, "item": target}, now=now)
+    return ids
+
+
+def _current(conn: sqlite3.Connection, item_id: int, *, reminded: bool = False) -> Optional[int]:
+    """The item still standing for ``item_id``: itself, or what replaced
+    it; None once it's closed. With ``reminded``,
+    a commitment whose reminder went out still stands: a chat can close it."""
+    standing = ("open", "reminded") if reminded else ("open",)
+    for _ in range(MAX_CHAIN):
+        row = conn.execute("SELECT status, superseded_by FROM items WHERE id=?", (item_id,)).fetchone()
+        if row is None or row["status"] not in standing:
+            return None
+        if row["superseded_by"] is None:
+            return item_id
+        item_id = row["superseded_by"]
+    return None
+
+
+def _prior(conn: sqlite3.Connection, item_id: int) -> dict[str, Any]:
+    """What an item and its checks are now, for a done mark's Undo."""
+    item = conn.execute("SELECT status, closed_by, closed_at FROM items WHERE id=?", (item_id,)).fetchone()
+    check = conn.execute("SELECT decision, next_check_at FROM followups WHERE item_id=?", (item_id,)).fetchone()
+    return {**(dict(item) if item else {}), **(dict(check) if check else {})}
+
+
+def _card_open(conn: sqlite3.Connection, card_id: int) -> bool:
+    """Whether a card is still open, as open_cards_about counts it: there,
+    not marked done, not put away for good, not rated not useful."""
+    return conn.execute(
+        "SELECT 1 FROM cards WHERE id=? AND id NOT IN (SELECT card_id FROM card_done) "
+        "AND (dismissed_at IS NULL OR rest_until IS NOT NULL) "
+        "AND NOT (coalesce(rating, '')='down' AND coalesce(reason, '')!='wrong_time')", (card_id,)).fetchone() is not None
+
+
+def _mark_cards_done(conn: sqlite3.Connection, item_id: int, *, prior: dict[str, Any], now: float) -> list[int]:
+    """Pulse's done mark, as mark_done makes it, on the cards Done takes
+    (follow-ups and report items) about ``item_id`` or an item it replaced
+    that aren't marked yet, each keeping ``prior`` for Undo; their ids."""
+    ids = [row["id"] for row in conn.execute(
+        "WITH RECURSIVE chain(id) AS (SELECT ? UNION SELECT items.id FROM items JOIN chain "
+        "ON items.superseded_by=chain.id) SELECT id FROM cards WHERE item_id IN (SELECT id FROM chain) "
+        "AND kind IN ('followup', ?) AND id NOT IN (SELECT card_id FROM card_done) ORDER BY id",
+        (item_id, NOTICED))]
+    for card_id in ids:
+        conn.execute("INSERT INTO card_done(card_id, done_at, done_by, prior_json) VALUES(?,?,?,?)",
+                     (card_id, now, PULSE, json.dumps(prior)))
+        conn.execute("UPDATE card_acts SET check_at=NULL WHERE card_id=?", (card_id,))
+        conn.execute("UPDATE cards SET seen_at=COALESCE(seen_at, ?) WHERE id=?", (now, card_id))
+    return ids
+
+
+class _Closing:
+    """A connection that closes when its ``with`` block ends (sqlite3's own
+    context manager only commits)."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def __enter__(self) -> sqlite3.Connection:
+        return self._conn
+
+    def __exit__(self, *exc: Any) -> None:
+        self._conn.close()
+
+
+def open_store(home: Path) -> PulseStore:
+    return PulseStore(Path(home) / DB_NAME)
+
+
+def in_flight_attempts(path: Path, busy_timeout_s: float = 1.0) -> list[tuple[str, float, str]]:
+    """Each attempt in flight as (home chat, when it was made, detail):
+    read-only, without the schema setup opening the store does, as Pulse's
+    tool hook asks this for every call in every chat."""
+    marks = ",".join("?" * len(IN_FLIGHT))
+    conn = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True, timeout=busy_timeout_s)
+    try:
+        rows = conn.execute(f"SELECT session_key, created_at, detail FROM attempts WHERE state IN ({marks})",
+                            IN_FLIGHT).fetchall()
+    finally:
+        conn.close()
+    return [(key or "", float(made or 0.0), detail or "") for key, made, detail in rows]
+
+
+def _proposal(row: sqlite3.Row) -> dict:
+    proposal = dict(row)
+    try:
+        fields = json.loads(proposal["fields"])
+    except (TypeError, ValueError):
+        fields = {}
+    proposal["fields"] = fields if isinstance(fields, dict) else {}
+    return proposal
+
+
+def card_moment(card: dict) -> dict[str, Any]:
+    """What a card held for a moment waits for (cards.moment, pulse_places):
+    {"place_id", "place", "kind", "on", "until"}; once a moment reached it,
+    "reached_at" and "at" (when the user got there or left); once its turn
+    is on its way, "attempt". {} for a card that waits for nothing."""
+    try:
+        value = json.loads(card.get("moment") or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def looked_labels(value: Any) -> list[str]:
+    """A stored list of what a Pulse turn looked up (attempts.looked,
+    cards.looked); [] for none or one that can't be read."""
+    try:
+        labels = json.loads(value) if value else []
+    except (TypeError, ValueError):
+        return []
+    return [label for label in labels if isinstance(label, str)] if isinstance(labels, list) else []

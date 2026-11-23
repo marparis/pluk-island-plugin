@@ -3,7 +3,7 @@
   "label": "PLUK Island",
   "description": "Routes the PLUK Island Android app calls on this host: pairing a device for notifications, and the list of what waits for you.",
   "icon": "Bell",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "tab": { "path": "/pluk-notify", "hidden": true },
   "entry": "index.js",
   "api": "plugin_api.py"

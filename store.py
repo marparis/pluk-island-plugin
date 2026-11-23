@@ -32,6 +32,11 @@ DEVICES = "devices.json"
 WAITING = "waiting.json"
 STATUS = "status.json"
 SETTINGS = "settings.json"
+MUTES = "mutes.json"
+# The last calls Hermes made, for the PC to ring too (GET /calls): only these few, never the chats' words.
+CALLS = "calls.json"
+MAX_CALLS = 20
+MAX_MUTES = 500
 ANDROID_PACKAGE = "com.pluk.island"
 
 MAX_DEVICES = 8
@@ -350,12 +355,63 @@ class Store:
     def set_calls(self, enabled: bool) -> None:
         self._write_settings(calls=bool(enabled))
 
-    def note_call(self, when: float) -> None:
+    def note_call(self, when: float, call: dict[str, Any] | None = None) -> None:
+        """A call rang: when (for the gap between two), and what it was (for the PC, which rings it too)."""
         self._write_settings(last_call_at=float(when))
+        if call is None:
+            return
+        with _exclusive(self.folder):
+            value = _read_json(self.folder / CALLS)
+            rows = [r for r in (value if isinstance(value, list) else []) if isinstance(r, dict)]
+            rows.append({"at": float(when), **{k: str(call.get(k) or "")[:300] for k in ("id", "profile", "session_id", "title", "reason")}})
+            _write_json(self.folder / CALLS, rows[-MAX_CALLS:])
+
+    def calls_after(self, after: float) -> list[dict[str, Any]]:
+        """The calls made after [after] (seconds since 1970), oldest first."""
+        value = _read_json(self.folder / CALLS)
+        rows = [r for r in (value if isinstance(value, list) else []) if isinstance(r, dict)]
+        return [r for r in rows if isinstance(r.get("at"), (int, float)) and r["at"] > after]
 
     def _write_settings(self, **changes: Any) -> None:
         with _exclusive(self.folder):
             _write_json(self.folder / SETTINGS, {**self.settings(), **changes})
+
+    # ------------------------------------------------------------ muted chats
+    # A chat muted for a while, or until unmuted (Conduit's muted chats, hermes-conduit-notifier
+    # /notifications/muted-chats; MIT, (c) 2026 Hermes Conduit contributors): its replies, progress and failures are
+    # not pushed. What waits for the user (an approval, a question) still is: an agent is blocked on it.
+
+    @staticmethod
+    def _mute_key(profile: str, session_id: str) -> str:
+        return f"{events.profile_name(profile)}\u0000{str(session_id)[:512]}"
+
+    def mutes(self, now: float | None = None) -> dict[str, float]:
+        """Every muted chat, "profile\\0session" -> until (0: until unmuted); the ended ones left out."""
+        value = _read_json(self.folder / MUTES)
+        moment = time.time() if now is None else now
+        out: dict[str, float] = {}
+        for key, until in (value.items() if isinstance(value, dict) else []):
+            if isinstance(key, str) and isinstance(until, (int, float)) and not isinstance(until, bool) and (until == 0 or until > moment):
+                out[key] = float(until)
+        return out
+
+    def set_mute(self, profile: str, session_id: str, until: float | None) -> None:
+        """Mutes a chat until [until] (0: until unmuted), or unmutes it (None)."""
+        if not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 512:
+            raise StoreError("bad_session", "A chat is named by its session id.")
+        with _exclusive(self.folder):
+            current = self.mutes()
+            key = self._mute_key(profile, session_id)
+            if until is None:
+                current.pop(key, None)
+            else:
+                current[key] = float(until)
+                while len(current) > MAX_MUTES:
+                    del current[next(iter(current))]
+            _write_json(self.folder / MUTES, current)
+
+    def is_muted(self, profile: str, session_id: str, now: float | None = None) -> bool:
+        return bool(session_id) and self._mute_key(profile, session_id) in self.mutes(now)
 
     # ------------------------------------------------------------ last delivery
 

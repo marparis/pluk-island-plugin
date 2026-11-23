@@ -55,6 +55,7 @@ class Hooks:
         title: Callable[[str], str] = lambda key: "",
         later: Callable[[float, Callable[[], None]], Any] | None = None,
         clock: Callable[[], float] = time.time,
+        gate: Any = None,
     ):
         self._enqueue = enqueue
         self._store = store
@@ -62,6 +63,8 @@ class Hooks:
         self._title = title
         self._later = later or self._timer
         self._clock = clock
+        # Pulse (pulse_hooks.Gate): whether a turn is one of Pulse's own, and what its push says
+        self._gate = gate
         self._lock = threading.Lock()
         self._children: dict[str, None] = {}
         self._clarify_args: dict[str, tuple[float, list[dict[str, Any]]]] = {}
@@ -174,7 +177,9 @@ class Hooks:
         session_id = _text(kwargs.get("session_id"))
         tool = _text(kwargs.get("tool_name"))
         if tool != "clarify":
-            self._at_work(session_id, tool)
+            # Pulse's own turn looks things up out of sight: no "at work" on the phone
+            if not self._pulse_turn(session_id, kwargs.get("turn_id")):
+                self._at_work(session_id, tool)
             return None
         questions = events.normalize_questions(kwargs.get("args"))
         if session_id and questions:
@@ -217,10 +222,14 @@ class Hooks:
         if not why:
             return False
         store = self._store()
-        store.note_call(self._clock())
+        identifier = events.event_id("call", session_id, int(self._clock()))
+        title = self._title(session_id)
+        # kept for the PC too: the Island rings with its call screen (GET /calls)
+        store.note_call(self._clock(), {"id": identifier, "profile": self._profile(), "session_id": session_id, "title": title,
+                                        "reason": why})
         self._enqueue(events.build(
-            events.CALL, identifier=events.event_id("call", session_id, int(self._clock())), profile=self._profile(),
-            session_id=session_id, platform=platform, title=self._title(session_id), body=why,
+            events.CALL, identifier=identifier, profile=self._profile(),
+            session_id=session_id, platform=platform, title=title, body=why,
         ))
         return True
 
@@ -352,20 +361,32 @@ class Hooks:
 
     # ------------------------------------------------------------ a turn's reply, or its failure
 
+    def _pulse_turn(self, session_id: str, turn_id: Any) -> bool:
+        return self._gate is not None and bool(session_id) and self._gate.is_pulse_turn(session_id, turn_id)
+
     def post_llm_call(self, **kwargs: Any) -> None:
         session_id = _text(kwargs.get("session_id"))
         platform = _text(kwargs.get("platform"))
         response = kwargs.get("assistant_response")
         if self._is_child(session_id) or platform in LOCAL_PLATFORMS:
             return
+        turn_id = _text(kwargs.get("turn_id"))
+        title = ""
+        if self._pulse_turn(session_id, turn_id):
+            # Pulse's own turn: its reply is pushed only when it is news (a follow-up, a report worth a push), titled
+            # by what it is, with its words kept home when they are private (Pulse decides: pulse.pushes, push_copy).
+            if not self._gate.pushes(session_id, turn_id, response):
+                return
+            copy = self._gate.push_copy(session_id, turn_id, response)
+            title = _text(copy.get("title")) or "Pulse"
+            response = copy.get("body") if isinstance(copy.get("body"), str) else response
         body = events.plain_text(response)
         if not body or events.is_silent_response(response) or self._automation(platform):
             return
-        turn_id = _text(kwargs.get("turn_id"))
         chat, thread = self._place() if platform == "telegram" else ("", "")
         ready = events.build(
             events.REPLY, identifier=events.event_id("response", turn_id or uuid.uuid4().hex, session_id), profile=self._profile(),
-            session_id=session_id, platform=platform, title=self._title(session_id), body=body, chat=chat, thread=thread,
+            session_id=session_id, platform=platform, title=title or self._title(session_id), body=body, chat=chat, thread=thread,
         )
         if not turn_id:
             self._enqueue(ready)
@@ -400,6 +421,14 @@ class Hooks:
         turn_id = _text(kwargs.get("turn_id"))
         platform = _text(kwargs.get("platform"))
         if self._is_child(session_id):
+            return
+        if self._pulse_turn(session_id, turn_id):
+            # Pulse's own turn: a reply it pushes goes as any other; a failure is Pulse's to record, not the phone's
+            answered = not kwargs.get("interrupted") and kwargs.get("failed") is not True
+            self._settle((session_id, turn_id), send=answered)
+            with self._lock:
+                self._progress.pop(session_id, None)
+            self._gate.turn_ended(session_id, turn_id)
             return
         # A turn that hit its step limit still answered: its reply goes out, not a failure (Conduit's rule).
         answered = (not kwargs.get("interrupted") and kwargs.get("failed") is not True

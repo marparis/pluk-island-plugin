@@ -107,7 +107,12 @@ def register(ctx: Any) -> None:
         _registered_profile = ctx.profile_name or "default"
     except Exception:  # noqa: BLE001
         _registered_profile = "default"
-    _hooks = Hooks(enqueue=delivery.enqueue, profile=_profile, title=_session_title)
+    # Pulse, taken from Hermes Conduit (pulse/, pulse_hooks.py): off unless turned on in the apps
+    from . import pulse_hooks
+
+    pulse_on = pulse_hooks.register(ctx)
+    _hooks = Hooks(enqueue=delivery.enqueue, profile=_profile, title=_session_title,
+                   gate=pulse_hooks.gate if pulse_on else None)
     for name in HOOKS:
         try:
             ctx.register_hook(name, _quiet(name, getattr(_hooks, name)))
@@ -213,3 +218,6 @@ def _unload() -> None:
     if _hooks is not None:
         _hooks.unload()
     delivery.stop()
+    from . import pulse_hooks
+
+    pulse_hooks.unload()

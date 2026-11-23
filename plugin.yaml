@@ -1,6 +1,6 @@
 name: pluk_notify
 manifest_version: 1
-version: 0.5.3
+version: 0.6.0
 description: "Push notifications for the PLUK Island Android app: approvals, questions, replies and failures, sealed end to end and sent through your own Firebase project."
 author: PLUK Island
 kind: standalone

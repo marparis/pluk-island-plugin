@@ -35,6 +35,10 @@ _seen: dict[str, None] = {}
 _sender = fcm.Sender()
 
 
+# What a muted chat no longer pushes; an approval, a question, their end and a call still go.
+MUTED_KINDS = frozenset({events.REPLY, events.PROGRESS, events.ENDED, events.FAILED})
+
+
 def deliver(event: dict[str, Any], *, store: Store | None = None, sender: fcm.Sender | None = None,
             only_device: str | None = None, pause: Callable[[float], None] = time.sleep) -> dict[str, Any]:
     """Sends [event] to every paired device that wants it, now. Returns counts and the last error's words."""
@@ -45,6 +49,10 @@ def deliver(event: dict[str, Any], *, store: Store | None = None, sender: fcm.Se
     if only_device is not None:
         devices = {k: v for k, v in devices.items() if k == only_device}
     if not devices:
+        return result
+    # a muted chat: no reply, progress or failure on the phone (what waits for the user still goes)
+    if event.get("type") in MUTED_KINDS and event.get("session_id") and store.is_muted(str(event.get("profile") or ""), str(event.get("session_id"))):
+        result["skipped"] = len(devices)
         return result
     if not sealing.available():
         result.update(failed=len(devices), error="the cryptography library is missing")
